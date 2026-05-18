@@ -1,0 +1,2402 @@
+from flask import Flask, render_template_string, Response, jsonify, request
+import cv2
+import face_recognition
+import numpy as np
+import threading
+import queue
+import pickle
+import os
+import base64
+import time
+from datetime import datetime
+import collections
+from ultralytics import YOLO
+import torch
+
+# --- Thread safety: limit internal threads to avoid segfaults with dlib/OpenCV/PyTorch ---
+cv2.setNumThreads(1)
+torch.set_num_threads(1)
+
+app = Flask(__name__)
+
+# --- Program Settings ---
+config = {
+    "conf": 0.50,
+    "imgsz": 640,
+    "face_tolerance": 0.55,
+    "draw_boxes": True,
+    "show_range": True,
+    "yolo_model": "yolo26n.pt",
+    "door_action": "log",
+    "era_action": "log",
+    "camera_source": "local",
+    "stream_url": "rtsp://192.168.100.59:8554/lsc_camera"
+}
+
+# --- AI Integration Config ---
+ai_config = {
+    "provider": "none",
+    "api_key": "",
+    "model": "",
+    "ollama_url": "http://localhost:11434",
+    "enabled": False
+}
+
+# --- YOLO Model ---
+model = YOLO(config["yolo_model"])
+
+# --- Define the target range (Region of Interest) ---
+range_x1, range_y1 = 150, 150
+range_x2, range_y2 = 500, 400
+
+# --- Global Stats for Frontend ---
+stats = {
+    "currently_in_range": 0,
+    "total_yolo_tracks": 0,
+    "total_known_faces": 0
+}
+
+tracked_ids = set()
+
+# --- Persistent Database for Long-Term Memory ---
+DB_FILE = "face_db.pkl"
+
+if os.path.exists(DB_FILE):
+    with open(DB_FILE, 'rb') as f:
+        data = pickle.load(f)
+        known_face_encodings = data['encodings']
+        known_face_ids = data['ids']
+        next_face_id = data['next_id']
+        known_face_names = data.get('names', {fid: f"Person {fid}" for fid in known_face_ids})
+        known_face_images = data.get('images', {fid: "" for fid in known_face_ids})
+        activity_logs = data.get('logs', [])
+        access_rules = data.get('rules', {})
+        era_rules = data.get('era_rules', {})
+        custom_spaces = data.get('custom_spaces', {})
+        print(f"Loaded {len(known_face_ids)} known faces from database!")
+else:
+    known_face_encodings = []
+    known_face_ids = []
+    known_face_names = {}
+    known_face_images = {}
+    activity_logs = []
+    access_rules = {}
+    era_rules = {}
+    custom_spaces = {}
+    next_face_id = 1
+
+db_lock = threading.RLock()
+state_lock = threading.Lock()
+# dlib (face_recognition backend) is NOT thread-safe — serialize all calls
+dlib_lock = threading.Lock()
+# Protect YOLO model access across camera thread and settings reload
+model_lock = threading.Lock()
+
+system_logs = collections.deque(maxlen=6)
+def log_event(msg):
+    current_time_str = datetime.utcnow().strftime("%I:%M:%S %p")
+    system_logs.append(f"<span class='text-blue-400/50 mr-2'>[{current_time_str}]</span> {msg}")
+
+log_event("> INITIALIZING SMART DOOR NEURAL KERNEL...")
+log_event("> CONNECTING TO LOCAL DATABASES...")
+log_event("> AWAITING CAMERA FEED...")
+
+def save_db():
+    with db_lock:
+        with open(DB_FILE, 'wb') as f:
+            pickle.dump({
+                'encodings': known_face_encodings,
+                'ids': known_face_ids,
+                'next_id': next_face_id,
+                'names': known_face_names,
+                'images': known_face_images,
+                'logs': activity_logs,
+                'rules': access_rules,
+                'era_rules': era_rules,
+                'custom_spaces': custom_spaces
+            }, f)
+
+track_to_face_id = {}
+active_sessions = {}
+hand_raised_start = {}
+door_zone_active = set()
+hand_last_seen = {}
+color_is_red = {}
+
+# --- Advanced ReID System ---
+clothing_profiles = {}
+
+def get_clothing_hist(rgb_img, x1, y1, x2, y2):
+    crop = rgb_img[max(0, y1):max(0, y2), max(0, x1):max(0, x2)]
+    if crop.size == 0:
+        return None
+    hsv = cv2.cvtColor(crop, cv2.COLOR_RGB2HSV)
+    hist = cv2.calcHist([hsv], [0, 1], None, [50, 60], [0, 180, 0, 256])
+    cv2.normalize(hist, hist, 0, 1, cv2.NORM_MINMAX)
+    return hist
+
+# --- Background Processing Setup ---
+face_processing_queue = queue.Queue()
+processing_track_ids = set()
+
+def process_faces_in_background():
+    global next_face_id
+    while True:
+        item = face_processing_queue.get()
+        if item is None:
+            break
+        
+        track_id, person_crop = item
+        try:
+            # dlib_lock serializes all face_recognition calls — dlib is NOT thread-safe
+            with dlib_lock:
+                face_locations = face_recognition.face_locations(person_crop, model="hog")
+                if face_locations:
+                    face_encoding = face_recognition.face_encodings(person_crop, face_locations, num_jitters=1)[0]
+                else:
+                    face_encoding = None
+
+            if face_encoding is not None:
+                with db_lock:
+                    if len(known_face_encodings) > 0:
+                        with dlib_lock:
+                            face_distances = face_recognition.face_distance(known_face_encodings, face_encoding)
+                        best_match_index = np.argmin(face_distances)
+                        
+                        if face_distances[best_match_index] < config["face_tolerance"]:
+                            face_id = known_face_ids[best_match_index]
+                            with state_lock:
+                                name = known_face_names.get(face_id, f"Person {face_id}")
+                                log_event(f"> IDENTITY CONFIRMED: {name}")
+                        else:
+                            face_id = next_face_id
+                            known_face_encodings.append(face_encoding)
+                            known_face_ids.append(face_id)
+                            known_face_names[face_id] = f"Person {face_id}"
+                            
+                            _, buffer = cv2.imencode('.jpg', cv2.cvtColor(person_crop, cv2.COLOR_RGB2BGR))
+                            known_face_images[face_id] = base64.b64encode(buffer).decode('utf-8')
+                            
+                            with state_lock:
+                                log_event(f"> NEW PERSON REGISTERED: ID #{face_id}")
+                            
+                            next_face_id += 1
+                            save_db()
+                    else:
+                        face_id = next_face_id
+                        known_face_encodings.append(face_encoding)
+                        known_face_ids.append(face_id)
+                        known_face_names[face_id] = f"Person {face_id}"
+                        
+                        _, buffer = cv2.imencode('.jpg', cv2.cvtColor(person_crop, cv2.COLOR_RGB2BGR))
+                        known_face_images[face_id] = base64.b64encode(buffer).decode('utf-8')
+                        
+                        with state_lock:
+                            log_event(f"> NEW PERSON REGISTERED: ID #{face_id}")
+                        
+                        next_face_id += 1
+                        save_db()
+                
+                track_to_face_id[track_id] = face_id
+        except Exception as e:
+            print(f"Error processing face: {e}")
+        finally:
+            if track_id not in track_to_face_id and track_id in processing_track_ids:
+                processing_track_ids.remove(track_id)
+            face_processing_queue.task_done()
+
+# Only 1 worker thread — dlib is NOT thread-safe, multiple threads cause segfaults
+threading.Thread(target=process_faces_in_background, daemon=True).start()
+
+latest_processed_frame = None
+camera_running = False
+
+def camera_loop():
+    global latest_processed_frame, camera_running
+    
+    camera_running = True
+    current_source = None
+    cap = None
+    
+    while camera_running:
+        expected_source = config.get("camera_source", "local")
+        stream_url = config.get("stream_url", "rtsp://192.168.100.59:8554/lsc_camera")
+        
+        # Auto-correct go2rtc HTML URLs to direct stream endpoints for OpenCV
+        if "stream.html?src=" in stream_url:
+            stream_url = stream_url.replace("stream.html?src=", "api/stream.mp4?src=")
+
+        if current_source != expected_source or cap is None or not cap.isOpened():
+            if cap is not None:
+                cap.release()
+            current_source = expected_source
+            source_val = 0 if current_source == "local" else stream_url
+            print(f"Connecting to camera: {source_val}")
+            
+            if current_source == "stream":
+                # Increase robustness for network streams
+                os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|analyzeduration;500000|probesize;5000000"
+                cap = cv2.VideoCapture(source_val, cv2.CAP_FFMPEG)
+            else:
+                cap = cv2.VideoCapture(source_val)
+                
+            if not cap.isOpened():
+                print(f"Error: Could not open camera {source_val}")
+                time.sleep(2)
+                continue
+                
+        success, frame = cap.read()
+        if not success:
+            print("Failed to read frame, attempting reconnect...")
+            cap.release()
+            cap = None
+            time.sleep(1)
+            continue
+            
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        with model_lock:
+            results = model.track(frame, persist=True, conf=config["conf"], imgsz=config["imgsz"], classes=[0], verbose=False, device="cpu")
+        
+        # Always compute h, w — used for door zone logic regardless of show_range
+        h, w = frame.shape[:2]
+        
+        if config["show_range"]:
+            # All space Target Range
+            cv2.rectangle(frame, (0, 0), (w, h), (56, 189, 248), 4)
+            cv2.putText(frame, "Target Range (All Space)", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (56, 189, 248), 2)
+            
+            # Door Zone at the bottom (centered rectangle)
+            door_x1_hud, door_y1_hud = w // 4, h - int(h * 0.25)
+            door_x2_hud, door_y2_hud = 3 * w // 4, h
+            cv2.rectangle(frame, (door_x1_hud, door_y1_hud), (door_x2_hud, door_y2_hud), (34, 197, 94), 2)
+            cv2.putText(frame, "Door Zone", (door_x1_hud, door_y1_hud - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (34, 197, 94), 2)
+
+        people_in_range = 0
+
+        if results[0].boxes.id is not None:
+            boxes = results[0].boxes.xyxy.cpu().numpy()
+            yolo_track_ids = results[0].boxes.id.cpu().numpy()
+            
+            has_keypoints = hasattr(results[0], 'keypoints') and results[0].keypoints is not None
+            keypoints_data = results[0].keypoints.xy.cpu().numpy() if has_keypoints else None
+
+            for i, (box, track_id) in enumerate(zip(boxes, yolo_track_ids)):
+                x1, y1, x2, y2 = map(int, box)
+                cx = (x1 + x2) // 2
+                cy = (y1 + y2) // 2
+                
+                # Hand Raise Detection
+                is_hand_raised = False
+                if keypoints_data is not None and len(keypoints_data) > i:
+                    kpts = keypoints_data[i]
+                    if len(kpts) >= 11:
+                        nose_y = kpts[0][1]
+                        l_wrist_y = kpts[9][1]
+                        r_wrist_y = kpts[10][1]
+                        if (l_wrist_y > 0 and l_wrist_y < nose_y) or (r_wrist_y > 0 and r_wrist_y < nose_y):
+                            is_hand_raised = True
+                            
+                current_time = time.time()
+                if is_hand_raised:
+                    hand_last_seen[track_id] = current_time
+                    if track_id not in hand_raised_start:
+                        hand_raised_start[track_id] = current_time
+                    if current_time - hand_raised_start[track_id] >= 3:
+                        if not color_is_red.get(track_id, False):
+                            with state_lock:
+                                log_event(f"> ATTENTION: HAND RAISE DETECTED (ID {track_id})")
+                        color_is_red[track_id] = True
+                else:
+                    last_seen = hand_last_seen.get(track_id, 0)
+                    if current_time - last_seen > 1.0:
+                        hand_raised_start.pop(track_id, None)
+                        color_is_red[track_id] = False
+
+                # Target Range is all space, so we detect everyone in the frame
+                people_in_range += 1
+                
+                # --- Face scanning/recognition always runs, independent of draw_boxes ---
+                if track_id not in tracked_ids:
+                    tracked_ids.add(track_id)
+                    stats["total_yolo_tracks"] += 1
+                    with state_lock:
+                        log_event(f"> NEW TARGET ACQUIRED (YOLO ID: {track_id})")
+                
+                display_id = track_to_face_id.get(track_id)
+                
+                # Clothing-based Re-ID
+                if display_id is None:
+                    current_hist = get_clothing_hist(rgb_frame, x1, y1, x2, y2)
+                    with state_lock:
+                        profiles_copy = clothing_profiles.copy()
+                    if current_hist is not None and len(profiles_copy) > 0:
+                        best_match = None
+                        best_score = 0.65
+                        for fid, hist in profiles_copy.items():
+                            if hist is not None:
+                                score = cv2.compareHist(current_hist, hist, cv2.HISTCMP_CORREL)
+                                if score > best_score:
+                                    best_score = score
+                                    best_match = fid
+                        if best_match is not None:
+                            track_to_face_id[track_id] = best_match
+                            display_id = best_match
+                
+                # Door zone logic always runs
+                if display_id is not None:
+                    with state_lock:
+                        clothing_profiles[display_id] = get_clothing_hist(rgb_frame, x1, y1, x2, y2)
+                    
+                    dz_x1, dz_y1 = w // 4, h - int(h * 0.25)
+                    dz_x2, dz_y2 = 3 * w // 4, h
+                    if dz_x1 < cx < dz_x2 and dz_y1 < cy < dz_y2:
+                        if display_id not in door_zone_active:
+                            door_zone_active.add(display_id)
+                            rule = access_rules.get(display_id, "Not Allowed")
+                            with state_lock:
+                                name = known_face_names.get(display_id, f"Person {display_id}")
+                                if rule == "Allowed":
+                                    log_event(f"> ACCESS GRANTED: {name} entered Door Zone.")
+                                else:
+                                    log_event(f"> ALERT: UNAUTHORIZED PERSON ({name}) in Door Zone!")
+                    else:
+                        if display_id in door_zone_active:
+                            door_zone_active.remove(display_id)
+                
+                # Queue for face recognition background scan if still unidentified
+                if display_id is None and track_id not in processing_track_ids:
+                    px1, py1 = max(0, x1 - 20), max(0, y1 - 20)
+                    px2, py2 = min(frame.shape[1], x2 + 20), min(frame.shape[0], y2 + 20)
+                    person_crop = rgb_frame[py1:py2, px1:px2]
+                    if person_crop.size > 0:
+                        processing_track_ids.add(track_id)
+                        face_processing_queue.put((track_id, person_crop.copy()))
+                
+                # Update active sessions
+                if display_id is not None:
+                    current_t = time.time()
+                    with state_lock:
+                        if display_id not in active_sessions:
+                            active_sessions[display_id] = {"login": current_t, "last_seen": current_t}
+                        else:
+                            active_sessions[display_id]["last_seen"] = current_t
+
+                # --- Drawing is separate and optional ---
+                if config["draw_boxes"]:
+                    cv2.circle(frame, (cx, cy), 4, (56, 189, 248), -1)
+                    
+                    if display_id is None:
+                        display_text = "Scanning..."
+                        box_color = (128, 128, 128)
+                    else:
+                        display_name = known_face_names.get(display_id, f"Person {display_id}")
+                        display_text = f"ID: {display_id} | {display_name}"
+                        box_color = (255, 191, 56)
+
+                    if color_is_red.get(track_id, False):
+                        display_text += " [ATTENTION]"
+                        box_color = (0, 0, 255)
+
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
+                    cv2.putText(frame, display_text, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, box_color, 2)
+
+        # Handle Session Timeouts
+        current_time = time.time()
+        expired_ids = []
+        logs_to_append = []
+        with state_lock:
+            for fid, session in list(active_sessions.items()):
+                if current_time - session["last_seen"] > 10:
+                    login_dt = datetime.utcfromtimestamp(session["login"]).strftime("%Y-%m-%d %H:%M:%S")
+                    logout_dt = datetime.utcfromtimestamp(session["last_seen"]).strftime("%Y-%m-%d %H:%M:%S")
+                    duration = round(session["last_seen"] - session["login"])
+                    
+                    if duration >= 2:
+                        name = known_face_names.get(fid, f"Person {fid}")
+                        log_event(f"> TARGET LOST: {name} ({duration}s)")
+                        logs_to_append.append({
+                            "face_id": fid,
+                            "login_time": login_dt,
+                            "logout_time": logout_dt,
+                            "duration_seconds": duration
+                        })
+                    expired_ids.append(fid)
+                    
+            for fid in expired_ids:
+                del active_sessions[fid]
+        
+        # Persist session logs outside of state_lock to avoid lock-ordering deadlock
+        if logs_to_append:
+            with db_lock:
+                activity_logs.extend(logs_to_append)
+                save_db()
+
+        stats["currently_in_range"] = people_in_range
+        stats["total_known_faces"] = len(known_face_ids)
+        
+        ret, buffer = cv2.imencode('.jpg', frame)
+        if ret:
+            with state_lock:
+                latest_processed_frame = buffer.tobytes()
+        
+        time.sleep(0.01)
+
+# Start background camera thread
+threading.Thread(target=camera_loop, daemon=True).start()
+
+def gen_frames():
+    while True:
+        with state_lock:
+            frame_bytes = latest_processed_frame
+            
+        if frame_bytes is not None:
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+        
+        time.sleep(0.03)
+
+# ================= API ROUTES ================= #
+
+@app.route('/video_feed')
+def video_feed():
+    return Response(gen_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+@app.route('/stats')
+def get_stats():
+    with state_lock:
+        s = stats.copy()
+        s["logs"] = list(system_logs)
+    return jsonify(s)
+
+@app.route('/faces', methods=['GET'])
+def get_faces():
+    return jsonify([
+        {
+            "id": fid, 
+            "name": known_face_names.get(fid, f"Person {fid}"),
+            "image": known_face_images.get(fid, "")
+        } 
+        for fid in known_face_ids
+    ])
+
+@app.route('/api/history', methods=['GET'])
+def api_history():
+    history = []
+    with state_lock:
+        for fid, session in active_sessions.items():
+            name = known_face_names.get(fid, f"Person {fid}")
+            login_dt = datetime.utcfromtimestamp(session["login"]).strftime("%Y-%m-%d %H:%M:%S")
+            history.append({
+                "id": fid,
+                "name": name,
+                "status": "Active",
+                "login_time": login_dt,
+                "logout_time": "Present",
+                "duration": "Counting..."
+            })
+    for log in reversed(activity_logs):
+        fid = log["face_id"]
+        name = known_face_names.get(fid, f"Person {fid}")
+        dur = log["duration_seconds"]
+        dur_str = f"{dur}s" if dur < 60 else f"{dur//60}m {dur%60}s"
+        history.append({
+            "id": fid,
+            "name": name,
+            "status": "Logged Out",
+            "login_time": log["login_time"],
+            "logout_time": log["logout_time"],
+            "duration": dur_str
+        })
+    return jsonify(history)
+
+@app.route('/api/history', methods=['DELETE'])
+def delete_history():
+    data = request.json
+    face_id = data.get('id')
+    login_time = data.get('login_time')
+    
+    with db_lock:
+        global activity_logs
+        if face_id == 'all':
+            activity_logs = []
+            save_db()
+            return jsonify({"success": True})
+        elif face_id is not None and login_time is not None:
+            original_len = len(activity_logs)
+            activity_logs = [log for log in activity_logs if not (log['face_id'] == face_id and log['login_time'] == login_time)]
+            if len(activity_logs) < original_len:
+                save_db()
+                return jsonify({"success": True})
+            return jsonify({"success": False, "error": "Log not found"}), 404
+        return jsonify({"success": False, "error": "Invalid request"}), 400
+
+@app.route('/api/settings', methods=['GET', 'POST'])
+def api_settings():
+    global model
+    if request.method == 'POST':
+        data = request.json
+        new_model_name = data.get("yolo_model", config.get("yolo_model", "yolo26n.pt"))
+        if new_model_name != config.get("yolo_model"):
+            print(f"Switching YOLO model to {new_model_name}...")
+            with model_lock:
+                model = YOLO(new_model_name)
+            config["yolo_model"] = new_model_name
+            
+        config["conf"] = float(data.get("conf", 0.50))
+        config["imgsz"] = int(data.get("imgsz", 640))
+        config["face_tolerance"] = float(data.get("face_tolerance", 0.55))
+        config["draw_boxes"] = bool(data.get("draw_boxes", True))
+        config["show_range"] = bool(data.get("show_range", True))
+        config["camera_source"] = data.get("camera_source", config.get("camera_source", "local"))
+        config["stream_url"] = data.get("stream_url", config.get("stream_url", "rtsp://192.168.100.59:8554/lsc_camera"))
+        return jsonify({"success": True})
+    return jsonify(config)
+
+@app.route('/update_face', methods=['POST'])
+def update_face():
+    data = request.json
+    old_id = int(data.get('old_id', data.get('id')))
+    new_name = data.get('name')
+    new_id_str = data.get('new_id')
+    
+    with db_lock:
+        if old_id in known_face_ids:
+            if new_id_str is not None and str(new_id_str).strip() != "" and int(new_id_str) != old_id:
+                new_id = int(new_id_str)
+                if new_id in known_face_ids:
+                    return jsonify({"success": False, "error": f"ID #{new_id} is already in use."}), 400
+                
+                idx = known_face_ids.index(old_id)
+                known_face_ids[idx] = new_id
+                
+                known_face_names[new_id] = new_name
+                del known_face_names[old_id]
+                
+                if old_id in known_face_images:
+                    known_face_images[new_id] = known_face_images.pop(old_id)
+                if old_id in access_rules:
+                    access_rules[new_id] = access_rules.pop(old_id)
+                if old_id in era_rules:
+                    era_rules[new_id] = era_rules.pop(old_id)
+                for space in custom_spaces.values():
+                    if old_id in space["rules"]:
+                        space["rules"][new_id] = space["rules"].pop(old_id)
+                    
+                with state_lock:
+                    if old_id in clothing_profiles:
+                        clothing_profiles[new_id] = clothing_profiles.pop(old_id)
+                    if old_id in active_sessions:
+                        active_sessions[new_id] = active_sessions.pop(old_id)
+                    if old_id in door_zone_active:
+                        door_zone_active.remove(old_id)
+                        door_zone_active.add(new_id)
+                    for k, v in list(track_to_face_id.items()):
+                        if v == old_id:
+                            track_to_face_id[k] = new_id
+                            
+                global next_face_id
+                if new_id >= next_face_id:
+                    next_face_id = new_id + 1
+            else:
+                known_face_names[old_id] = new_name
+                
+            save_db()
+            return jsonify({"success": True})
+    return jsonify({"success": False, "error": "ID not found"}), 404
+
+@app.route('/api/rules', methods=['GET', 'POST'])
+def api_rules():
+    global access_rules
+    if request.method == 'GET':
+        with state_lock:
+            return jsonify(access_rules)
+    else:
+        data = request.json
+        fid = data.get('id')
+        role = data.get('role')
+        if fid is not None and role:
+            with db_lock:
+                access_rules[fid] = role
+                save_db()
+            return jsonify({"success": True})
+        return jsonify({"success": False})
+
+@app.route('/api/violation_action', methods=['POST'])
+def api_violation_action():
+    data = request.json
+    zone = data.get('zone')
+    action = data.get('action')
+    if zone == 'door':
+        config['door_action'] = action
+    elif zone == 'era':
+        config['era_action'] = action
+    return jsonify({"success": True})
+
+@app.route('/api/era_rules', methods=['GET', 'POST'])
+def api_era_rules():
+    global era_rules
+    if request.method == 'GET':
+        with state_lock:
+            return jsonify(era_rules)
+    else:
+        data = request.json
+        fid = data.get('id')
+        role = data.get('role')
+        if fid is not None and role:
+            with db_lock:
+                era_rules[fid] = role
+                save_db()
+            return jsonify({"success": True})
+        return jsonify({"success": False})
+
+@app.route('/api/custom_spaces', methods=['GET'])
+def api_custom_spaces():
+    with state_lock:
+        return jsonify(custom_spaces)
+
+@app.route('/api/add_custom_space', methods=['POST'])
+def api_add_custom_space():
+    name = request.json.get('name')
+    if name:
+        with db_lock:
+            if name not in custom_spaces:
+                custom_spaces[name] = {"action": "log", "rules": {}}
+                save_db()
+        return jsonify({"success": True})
+    return jsonify({"success": False})
+
+@app.route('/api/delete_custom_space', methods=['POST'])
+def api_delete_custom_space():
+    name = request.json.get('name')
+    with db_lock:
+        if name in custom_spaces:
+            del custom_spaces[name]
+            save_db()
+    return jsonify({"success": True})
+
+@app.route('/api/custom_space_rule', methods=['POST'])
+def api_custom_space_rule():
+    data = request.json
+    space_name = data.get('space_name')
+    fid = data.get('id')
+    role = data.get('role')
+    if space_name in custom_spaces and fid is not None and role:
+        with db_lock:
+            if not isinstance(fid, int):
+                fid = int(fid)
+            custom_spaces[space_name]["rules"][fid] = role
+            save_db()
+        return jsonify({"success": True})
+    return jsonify({"success": False})
+
+@app.route('/api/custom_space_action', methods=['POST'])
+def api_custom_space_action():
+    data = request.json
+    space_name = data.get('space_name')
+    action = data.get('action')
+    if space_name in custom_spaces and action:
+        with db_lock:
+            custom_spaces[space_name]["action"] = action
+            save_db()
+        return jsonify({"success": True})
+    return jsonify({"success": False})
+
+@app.route('/delete_face/<int:fid>', methods=['DELETE'])
+def delete_face(fid):
+    with db_lock:
+        if fid in known_face_ids:
+            idx = known_face_ids.index(fid)
+            known_face_ids.pop(idx)
+            known_face_encodings.pop(idx)
+            known_face_names.pop(fid, None)
+            known_face_images.pop(fid, None)
+            access_rules.pop(fid, None)
+            era_rules.pop(fid, None)
+            for space in custom_spaces.values():
+                space["rules"].pop(fid, None)
+            
+            with state_lock:
+                keys_to_delete = [k for k, v in track_to_face_id.items() if v == fid]
+                for k in keys_to_delete:
+                    del track_to_face_id[k]
+                clothing_profiles.pop(fid, None)
+                active_sessions.pop(fid, None)
+                if fid in door_zone_active:
+                    door_zone_active.remove(fid)
+                    
+            save_db()
+            return jsonify({"success": True})
+    return jsonify({"success": False, "error": "ID not found"}), 404
+
+@app.route('/upload_face', methods=['POST'])
+def upload_face():
+    global next_face_id
+    name = request.form.get('name', 'Uploaded Person')
+    file = request.files.get('file')
+    if not file: 
+        return jsonify({"success": False, "error": "No image file provided"})
+    
+    try:
+        file_bytes = np.frombuffer(file.read(), np.uint8)
+        img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+        rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        
+        face_locations = face_recognition.face_locations(rgb_img, model="hog")
+        if not face_locations:
+            return jsonify({"success": False, "error": "No face detected in the image"})
+        
+        face_encoding = face_recognition.face_encodings(rgb_img, face_locations, num_jitters=2)[0]
+        
+        with db_lock:
+            custom_id = request.form.get('custom_id')
+            if custom_id is not None and custom_id.strip() != "":
+                face_id = int(custom_id)
+                if face_id in known_face_ids:
+                    return jsonify({"success": False, "error": f"ID #{face_id} is already in use by {known_face_names.get(face_id)}."})
+                if face_id >= next_face_id:
+                    next_face_id = face_id + 1
+            else:
+                face_id = next_face_id
+                next_face_id += 1
+
+            known_face_encodings.append(face_encoding)
+            known_face_ids.append(face_id)
+            known_face_names[face_id] = name
+            
+            top, right, bottom, left = face_locations[0]
+            top = max(0, top-20)
+            bottom = min(rgb_img.shape[0], bottom+20)
+            left = max(0, left-20)
+            right = min(rgb_img.shape[1], right+20)
+            
+            face_crop = rgb_img[top:bottom, left:right]
+            _, buffer = cv2.imencode('.jpg', cv2.cvtColor(face_crop, cv2.COLOR_RGB2BGR))
+            known_face_images[face_id] = base64.b64encode(buffer).decode('utf-8')
+            
+            save_db()
+        return jsonify({"success": True})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)})
+
+
+@app.route('/api/ai_settings', methods=['GET', 'POST'])
+def api_ai_settings():
+    global ai_config
+    if request.method == 'POST':
+        data = request.json
+        ai_config["provider"] = data.get("provider", "none")
+        ai_config["api_key"] = data.get("api_key", "")
+        ai_config["model"] = data.get("model", "")
+        ai_config["ollama_url"] = data.get("ollama_url", "http://localhost:11434")
+        ai_config["enabled"] = bool(data.get("enabled", False))
+        return jsonify({"success": True})
+    return jsonify(ai_config)
+
+
+@app.route('/api/ai_query', methods=['POST'])
+def api_ai_query():
+    data = request.json
+    prompt = data.get("prompt", "")
+    provider = ai_config.get("provider", "none")
+    api_key = ai_config.get("api_key", "")
+    model = ai_config.get("model", "")
+    ollama_url = ai_config.get("ollama_url", "http://localhost:11434")
+
+    if provider == "none" or not ai_config.get("enabled", False):
+        return jsonify({"success": False, "error": "AI is not enabled or no provider configured."})
+
+    try:
+        if provider == "openai":
+            import urllib.request, json as _json
+            headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
+            body = _json.dumps({"model": model or "gpt-4o", "messages": [{"role": "user", "content": prompt}]}).encode()
+            req = urllib.request.Request("https://api.openai.com/v1/chat/completions", data=body, headers=headers)
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                result = _json.loads(resp.read())
+            return jsonify({"success": True, "response": result["choices"][0]["message"]["content"]})
+
+        elif provider == "gemini":
+            import urllib.request, json as _json
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model or 'gemini-2.0-flash'}:generateContent?key={api_key}"
+            body = _json.dumps({"contents": [{"parts": [{"text": prompt}]}]}).encode()
+            req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                result = _json.loads(resp.read())
+            return jsonify({"success": True, "response": result["candidates"][0]["content"]["parts"][0]["text"]})
+
+        elif provider == "anthropic":
+            import urllib.request, json as _json
+            headers = {"Content-Type": "application/json", "x-api-key": api_key, "anthropic-version": "2023-06-01"}
+            body = _json.dumps({"model": model or "claude-3-5-sonnet-20241022", "max_tokens": 1024, "messages": [{"role": "user", "content": prompt}]}).encode()
+            req = urllib.request.Request("https://api.anthropic.com/v1/messages", data=body, headers=headers)
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                result = _json.loads(resp.read())
+            return jsonify({"success": True, "response": result["content"][0]["text"]})
+
+        elif provider == "ollama":
+            import urllib.request, json as _json
+            url = f"{ollama_url.rstrip('/')}/api/generate"
+            body = _json.dumps({"model": model or "llama3", "prompt": prompt, "stream": False}).encode()
+            req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                result = _json.loads(resp.read())
+            return jsonify({"success": True, "response": result.get("response", "")})
+
+        else:
+            return jsonify({"success": False, "error": f"Unknown provider: {provider}"})
+
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)})
+
+
+# ================= FRONTEND SPA ================= #
+# Contains all the sleek UI from the React files, seamlessly
+# interacting with the Flask endpoints.
+
+INDEX_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SMART DOOR - Neural Security</title>
+    
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    
+    <style>
+        :root {
+            --color-bg: #0f172a;
+            --color-surface: #1e293b;
+            --color-on-surface: #f8fafc;
+            --color-border: rgba(255, 255, 255, 0.08);
+            color-scheme: dark;
+        }
+
+        .light-mode {
+            --color-bg: #f8fafc;
+            --color-surface: #ffffff;
+            --color-on-surface: #0f172a;
+            --color-border: #e2e8f0;
+            color-scheme: light;
+        }
+
+        body {
+            background-color: var(--color-bg);
+            color: var(--color-on-surface);
+            font-family: "Roboto", ui-sans-serif, system-ui, sans-serif;
+            margin: 0;
+            transition: background-color 0.3s ease, color 0.3s ease;
+        }
+
+        .font-mono {
+            font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+        }
+
+        select option {
+            background-color: var(--color-surface);
+            color: var(--color-on-surface);
+        }
+
+        .bento-card {
+            background-color: var(--color-surface);
+            color: var(--color-on-surface);
+            border-radius: 24px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.12), 0 1px 2px rgba(0,0,0,0.24);
+            transition: all 0.3s cubic-bezier(.25,.8,.25,1);
+            border: 1px solid var(--color-border);
+        }
+
+        .bento-card:hover {
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1), 0 2px 4px rgba(0,0,0,0.06);
+        }
+
+        .nav-btn.active {
+            background-color: rgba(59, 130, 246, 0.15);
+            color: #3b82f6;
+        }
+
+        .light-mode .nav-btn.active {
+            background-color: #dbeafe;
+            color: #1d4ed8;
+        }
+
+        .animate-in { animation: fadeIn 0.4s ease-out forwards; }
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        
+        .delay-100 { animation-delay: 100ms; }
+        .delay-200 { animation-delay: 200ms; }
+
+        /* Custom Scrollbar */
+        ::-webkit-scrollbar { width: 8px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: rgba(128,128,128,0.3); border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: rgba(128,128,128,0.5); }
+    </style>
+</head>
+<body class="min-h-screen relative transition-colors duration-300">
+    
+    <!-- HEADER -->
+    <header class="relative z-10 w-full px-4 py-8 md:px-8 mb-4">
+        <div class="flex flex-col md:flex-row md:items-center justify-between gap-6">
+            <div class="flex items-center gap-4">
+                <div class="p-3 bg-blue-600 rounded-full shadow-md">
+                    <i data-lucide="radar" class="w-8 h-8 text-white"></i>
+                </div>
+                <div>
+                    <h1 class="text-3xl font-bold tracking-tight">SMART DOOR</h1>
+                    <p class="text-sm font-medium opacity-70">Advanced Security System</p>
+                </div>
+            </div>
+
+            <nav class="flex flex-wrap items-center gap-2 bg-[var(--color-surface)] shadow-sm p-1.5 rounded-full border border-[var(--color-border)]">
+                <button onclick="switchView('dashboard')" id="nav-dashboard" class="nav-btn active flex items-center gap-2 px-5 py-2.5 rounded-full font-medium transition-all duration-200 hover:bg-black/5 dark:hover:bg-white/5 opacity-70 hover:opacity-100">
+                    <i data-lucide="layout-dashboard" class="w-5 h-5"></i><span class="hidden sm:inline">Dashboard</span>
+                </button>
+                <button onclick="switchView('history')" id="nav-history" class="nav-btn flex items-center gap-2 px-5 py-2.5 rounded-full font-medium transition-all duration-200 hover:bg-black/5 dark:hover:bg-white/5 opacity-70 hover:opacity-100">
+                    <i data-lucide="history" class="w-5 h-5"></i><span class="hidden sm:inline">History</span>
+                </button>
+                <button onclick="switchView('identities')" id="nav-identities" class="nav-btn flex items-center gap-2 px-5 py-2.5 rounded-full font-medium transition-all duration-200 hover:bg-black/5 dark:hover:bg-white/5 opacity-70 hover:opacity-100">
+                    <i data-lucide="database" class="w-5 h-5"></i><span class="hidden sm:inline">Database</span>
+                </button>
+                <button onclick="switchView('settings')" id="nav-settings" class="nav-btn flex items-center gap-2 px-5 py-2.5 rounded-full font-medium transition-all duration-200 hover:bg-black/5 dark:hover:bg-white/5 opacity-70 hover:opacity-100">
+                    <i data-lucide="settings" class="w-5 h-5"></i><span class="hidden sm:inline">Settings</span>
+                </button>
+                <button onclick="switchView('custom')" id="nav-custom" class="nav-btn flex items-center gap-2 px-5 py-2.5 rounded-full font-medium transition-all duration-200 hover:bg-black/5 dark:hover:bg-white/5 opacity-70 hover:opacity-100">
+                    <i data-lucide="shield-alert" class="w-5 h-5"></i><span class="hidden sm:inline">Custom</span>
+                </button>
+                <button onclick="switchView('ai')" id="nav-ai" class="nav-btn flex items-center gap-2 px-5 py-2.5 rounded-full font-medium transition-all duration-200 hover:bg-black/5 dark:hover:bg-white/5 opacity-70 hover:opacity-100">
+                    <i data-lucide="cpu" class="w-5 h-5"></i><span class="hidden sm:inline">AI</span>
+                </button>
+                
+                <div class="w-px h-8 bg-black/10 dark:bg-white/10 mx-1"></div>
+                
+                <button onclick="toggleTheme()" class="flex items-center justify-center w-10 h-10 rounded-full opacity-70 hover:opacity-100 hover:bg-black/5 dark:hover:bg-white/5 transition-all duration-200" title="Toggle Theme">
+                    <i data-lucide="moon" id="theme-icon" class="w-5 h-5"></i>
+                </button>
+            </nav>
+        </div>
+    </header>
+
+    <!-- MAIN VIEWS -->
+    <main class="relative z-10 w-full px-4 pb-12 md:px-8">
+        
+        <!-- DASHBOARD VIEW -->
+        <div id="view-dashboard" class="view-section animate-in">
+            <div class="grid grid-cols-1 lg:grid-cols-3 gap-8">
+                
+                <div class="space-y-6 lg:col-span-2">
+                    <div class="bento-card p-4 md:p-6 shadow-2xl relative group">
+                        <div class="w-full bg-black rounded-2xl flex items-center justify-center overflow-hidden border-2 border-white/5 shadow-2xl relative">
+                            <img src="/video_feed" alt="Video Feed" class="block max-w-full h-auto">
+                            
+                            <!-- Overlays -->
+                            <div class="absolute top-4 left-4 flex gap-2">
+                                <div class="px-3 py-1 bg-red-600 rounded-full flex items-center gap-2 text-xs font-medium text-white shadow-md uppercase tracking-wider">
+                                    <span class="w-2 h-2 bg-white rounded-full animate-pulse"></span>
+                                    live
+                                </div>
+                            </div>
+                            <div class="absolute top-4 right-4 text-white font-mono text-xs bg-black/50 backdrop-blur px-3 py-1 rounded-full" id="clock">
+                                00:00:00
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="grid grid-cols-1 sm:grid-cols-3 gap-6">
+                        <div class="bento-card p-6 flex flex-col gap-4">
+                            <div class="w-12 h-12 rounded-full flex items-center justify-center bg-black/5 dark:bg-white/5 text-blue-500">
+                                <i data-lucide="activity" class="w-6 h-6"></i>
+                            </div>
+                            <div>
+                                <div class="text-sm font-medium opacity-70 mb-1">Person in Range</div>
+                                <div class="text-3xl font-bold" id="stat-range">0</div>
+                            </div>
+                        </div>
+                        <div class="bento-card p-6 flex flex-col gap-4">
+                            <div class="w-12 h-12 rounded-full flex items-center justify-center bg-black/5 dark:bg-white/5 text-emerald-500">
+                                <i data-lucide="user-check" class="w-6 h-6"></i>
+                            </div>
+                            <div>
+                                <div class="text-sm font-medium opacity-70 mb-1">Database Size</div>
+                                <div class="text-3xl font-bold" id="stat-faces">0</div>
+                            </div>
+                        </div>
+                        <div class="bento-card p-6 flex flex-col gap-4">
+                            <div class="w-12 h-12 rounded-full flex items-center justify-center bg-black/5 dark:bg-white/5 text-purple-500">
+                                <i data-lucide="maximize-2" class="w-6 h-6"></i>
+                            </div>
+                            <div>
+                                <div class="text-sm font-medium opacity-70 mb-1">N.P detected in this range</div>
+                                <div class="text-3xl font-bold" id="stat-tracks">0</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="space-y-6">
+                    <div class="bento-card p-6 h-full min-h-[500px] flex flex-col">
+                        <div class="flex items-center justify-between mb-8">
+                            <h3 class="text-xl font-bold flex items-center gap-2">
+                                <i data-lucide="search" class="w-5 h-5 text-blue-500"></i>
+                                Recent Scans
+                            </h3>
+                            <span class="px-3 py-1 bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400 text-xs font-bold rounded-full flex items-center gap-2">
+                                <div class="w-1.5 h-1.5 bg-blue-500 rounded-full animate-pulse"></div>LIVE
+                            </span>
+                        </div>
+
+                        <div class="space-y-4 flex-1" id="recent-scans">
+                            <div class="text-center py-12">
+                                <div class="w-12 h-12 bg-black/5 dark:bg-white/5 rounded-full flex items-center justify-center mx-auto mb-4">
+                                    <i data-lucide="activity" class="w-6 h-6 opacity-50"></i>
+                                </div>
+                                <p class="text-sm opacity-70">Waiting for detection events...</p>
+                            </div>
+                        </div>
+
+                        <div class="mt-8 p-5 bg-blue-50 dark:bg-blue-900/10 border-0 rounded-3xl">
+                            <h4 class="text-base font-bold text-blue-700 dark:text-blue-300 mb-2 flex items-center gap-2">
+                                <i data-lucide="shield" class="w-5 h-5"></i>AI Scene Intelligence
+                            </h4>
+                            <p class="text-sm text-blue-900/70 dark:text-blue-100/70 mb-5 leading-relaxed">
+                                Activate deep-neural analysis for behavioral heuristics and spatial mapping of current environment.
+                            </p>
+                            <button onclick="runHeuristics(this)" class="w-full py-3 bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium rounded-full transition-all shadow-sm">
+                                Run Behavioral Heuristics
+                            </button>
+                        </div>
+                        
+                        <div class="mt-8 p-5 bg-slate-900 dark:bg-[#0a0a0a] rounded-3xl h-48 overflow-y-hidden font-mono text-xs text-emerald-400 flex flex-col justify-end">
+                            <div class="space-y-1.5" id="terminal-logs">
+                                <!-- Logs injected via JS -->
+                            </div>
+                            <div class="animate-pulse mt-2 flex items-center text-emerald-400">
+                                <span class="text-blue-400/50 mr-2" id="term-time"></span>
+                                &gt; <div class="w-2 h-3 bg-emerald-400 ml-1"></div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- HISTORY VIEW -->
+        <div id="view-history" class="view-section hidden animate-in">
+            <div class="bento-card p-6 md:p-10">
+                <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-8">
+                    <div>
+                        <h2 class="text-2xl md:text-3xl font-bold">Presence History</h2>
+                        <p class="opacity-70 text-sm mt-1">Real-time log of detection</p>
+                    </div>
+                    <div class="flex gap-2">
+                        <button onclick="clearHistory()" class="px-4 py-2 bg-red-500/10 hover:bg-red-500/20 text-red-500 border border-red-500/20 rounded-full text-sm font-medium flex items-center gap-2 transition-colors">
+                            <i data-lucide="trash-2" class="w-4 h-4"></i> Clear All
+                        </button>
+                        <div class="px-4 py-2 bg-black/5 dark:bg-white/5 border border-[var(--color-border)] rounded-full text-sm font-medium flex items-center gap-2 max-w-max">
+                            <i data-lucide="clock" class="w-4 h-4 opacity-70"></i> Session Logs
+                        </div>
+                    </div>
+                </div>
+
+                <div class="overflow-x-auto">
+                    <table class="w-full text-left border-collapse">
+                        <thead>
+                            <tr class="text-sm font-medium opacity-70 border-b border-[var(--color-border)]">
+                                <th class="py-4 pl-4 font-medium">Subject</th>
+                                <th class="py-4 font-medium">Status</th>
+                                <th class="py-4 font-medium">Log In</th>
+                                <th class="py-4 font-medium">Log Out</th>
+                                <th class="py-4 pr-4 font-medium text-right">Duration</th>
+                            </tr>
+                        </thead>
+                        <tbody class="divide-y divide-[var(--color-border)]" id="history-tbody">
+                            <tr><td colspan="5" class="text-center py-20 opacity-70">Loading neural events...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- IDENTITIES VIEW -->
+        <div id="view-identities" class="view-section hidden animate-in">
+            <div class="space-y-8">
+                <div class="flex flex-col md:flex-row md:items-center justify-between gap-6">
+                    <div class="relative flex-1 max-w-md">
+                        <i data-lucide="search" class="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 opacity-50"></i>
+                        <input type="text" id="id-search" placeholder="Search neural parameters..." onkeyup="renderFaces()" class="w-full pl-12 pr-4 py-3 bg-black/5 dark:bg-white/5 border border-[var(--color-border)] rounded-full placeholder:opacity-50 focus:outline-none focus:ring-2 focus:ring-blue-500/40 transition-all font-medium">
+                    </div>
+                    <button onclick="document.getElementById('add-modal').classList.remove('hidden')" class="flex items-center justify-center gap-2 px-6 py-3 bg-blue-600 hover:bg-blue-700 text-white font-medium rounded-full shadow-sm transition-all active:scale-95">
+                        <i data-lucide="plus" class="w-5 h-5"></i> New
+                    </button>
+                </div>
+
+                <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6" id="identities-grid">
+                    <!-- Faces injected via JS -->
+                </div>
+            </div>
+            
+            <!-- Add Modal -->
+            <div id="add-modal" class="fixed inset-0 z-50 flex items-center justify-center p-4 hidden">
+                <div class="absolute inset-0 bg-black/60 backdrop-blur-sm" onclick="document.getElementById('add-modal').classList.add('hidden')"></div>
+                <div class="relative bg-[var(--color-surface)] border border-[var(--color-border)] rounded-3xl p-8 w-full max-w-md shadow-2xl animate-in">
+                    <h2 class="text-2xl font-bold mb-6">Map Neural Person</h2>
+                    <div class="space-y-6">
+                        <div>
+                            <label class="block text-sm font-medium opacity-70 mb-2">Person Designation</label>
+                            <input type="text" id="new_name" placeholder="e.g. Target Alpha" class="w-full px-4 py-3 bg-black/5 dark:bg-white/5 border border-[var(--color-border)] rounded-2xl placeholder:opacity-50 focus:outline-none focus:ring-2 focus:ring-blue-500/40 transition-all">
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium opacity-70 mb-2">ID Number (Optional)</label>
+                            <input type="number" id="new_id" placeholder="Auto-assign" class="w-full px-4 py-3 bg-black/5 dark:bg-white/5 border border-[var(--color-border)] rounded-2xl placeholder:opacity-50 focus:outline-none focus:ring-2 focus:ring-blue-500/40 transition-all font-mono">
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium opacity-70 mb-2">Detection Photo (File)</label>
+                            <input type="file" id="new_photo" accept="image/*" class="w-full px-4 py-3 bg-black/5 dark:bg-white/5 border border-[var(--color-border)] rounded-2xl placeholder:opacity-50 focus:outline-none focus:ring-2 focus:ring-blue-500/40 transition-all font-mono text-sm">
+                        </div>
+                        <div class="flex gap-4 pt-4">
+                            <button onclick="document.getElementById('add-modal').classList.add('hidden')" class="flex-1 py-3 bg-black/5 dark:bg-white/5 hover:bg-black/10 dark:hover:bg-white/10 font-medium rounded-full transition-all">Cancel</button>
+                            <button onclick="uploadFace()" id="btn-upload" class="flex-1 py-3 bg-blue-600 hover:bg-blue-700 text-white font-medium rounded-full shadow-sm transition-all">Confirm Sync</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- SETTINGS VIEW -->
+        <div id="view-settings" class="view-section hidden animate-in">
+            <div class="space-y-8">
+
+                <!-- Header -->
+                <div class="flex items-center gap-4">
+                    <div class="p-3 bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400 rounded-full">
+                        <i data-lucide="settings" class="w-8 h-8"></i>
+                    </div>
+                    <div>
+                        <h2 class="text-3xl font-bold">System Parameters</h2>
+                        <p class="opacity-70 text-sm">Configure global neural heuristics and AI weights</p>
+                    </div>
+                </div>
+
+                <!-- Two-column grid -->
+                <div class="grid grid-cols-1 xl:grid-cols-2 gap-6 items-start">
+
+                    <!-- Left: Neural Architecture -->
+                    <div class="bento-card p-8 space-y-6">
+                        <div class="flex items-center gap-2 text-blue-600 dark:text-blue-400 font-medium text-sm">
+                            <i data-lucide="brain" class="w-5 h-5"></i> Neural Architecture
+                        </div>
+
+                        <div>
+                            <label class="block text-sm font-medium opacity-70 mb-2">YOLO AI Engine Model</label>
+                            <select id="set_model" class="w-full px-4 py-3 bg-black/5 dark:bg-white/5 border border-[var(--color-border)] rounded-2xl focus:outline-none focus:ring-2 focus:ring-blue-500/40 transition-all font-medium appearance-none cursor-pointer">
+                                <option value="yolo26n.pt">YOLOv26 Nano (Fastest)</option>
+                                <option value="yolo26s.pt">YOLOv26 Small</option>
+                                <option value="yolo26m.pt">YOLOv26 Medium</option>
+                                <option value="yolo26l.pt">YOLOv26 Large</option>
+                                <option value="yolo26x.pt">YOLOv26 Extra Large (Most Accurate)</option>
+                            </select>
+                            <p class="text-xs opacity-70 mt-2 flex items-center gap-1 leading-relaxed">
+                                <i data-lucide="alert-circle" class="w-4 h-4"></i> Make sure the model supports pose if you need skeletal heuristic features.
+                            </p>
+                        </div>
+
+                        <div>
+                            <label class="block text-sm font-medium opacity-70 mb-2">Inference Resolution</label>
+                            <select id="set_imgsz" class="w-full px-4 py-3 bg-black/5 dark:bg-white/5 border border-[var(--color-border)] rounded-2xl focus:outline-none focus:ring-2 focus:ring-blue-500/40 transition-all font-medium appearance-none cursor-pointer">
+                                <option value="320">Low (320px) - Fastest</option>
+                                <option value="640">Medium (640px) - Balanced</option>
+                                <option value="1080">Full HD (1080px)</option>
+                                <option value="1280">High (1280px) - Accurate</option>
+                                <option value="1440">2K Quad HD (1440px)</option>
+                                <option value="2160">4K Ultra HD (2160px)</option>
+                            </select>
+                        </div>
+
+                        <div>
+                            <label class="block text-sm font-medium opacity-70 mb-2">Camera Source Type</label>
+                            <select id="set_camera" onchange="document.getElementById('stream_url_container').style.display = this.value === 'stream' ? 'block' : 'none';" class="w-full px-4 py-3 bg-black/5 dark:bg-white/5 border border-[var(--color-border)] rounded-2xl focus:outline-none focus:ring-2 focus:ring-blue-500/40 transition-all font-medium appearance-none cursor-pointer">
+                                <option value="local">Local Web Camera</option>
+                                <option value="stream">Network Stream (URL)</option>
+                            </select>
+                        </div>
+
+                        <div id="stream_url_container" style="display: none;">
+                            <label class="block text-sm font-medium opacity-70 mb-2">Stream URL</label>
+                            <input type="text" id="set_stream_url" placeholder="e.g. rtsp://192.168.100.59:8554/lsc_camera" class="w-full px-4 py-3 bg-black/5 dark:bg-white/5 border border-[var(--color-border)] rounded-2xl placeholder:opacity-50 focus:outline-none focus:ring-2 focus:ring-blue-500/40 transition-all font-medium text-sm">
+                        </div>
+                    </div>
+
+                    <!-- Right: Thresholds + HUD + Save -->
+                    <div class="bento-card p-8 space-y-8">
+
+                        <section class="space-y-4">
+                            <div class="flex items-center gap-2 text-emerald-600 dark:text-emerald-400 font-medium text-sm">
+                                <i data-lucide="sliders" class="w-5 h-5"></i> Inference Thresholds
+                            </div>
+                            <div class="grid grid-cols-1 sm:grid-cols-2 gap-6">
+                                <div>
+                                    <label class="block text-sm font-medium opacity-70 mb-2">Confidence Cutoff (<span id="conf_val">0.50</span>)</label>
+                                    <input type="range" id="set_conf" min="0.1" max="1.0" step="0.05" oninput="document.getElementById('conf_val').innerText=this.value" class="w-full h-2 bg-black/10 dark:bg-white/10 rounded-full appearance-none cursor-pointer accent-blue-600 dark:accent-blue-400">
+                                </div>
+                                <div>
+                                    <label class="block text-sm font-medium opacity-70 mb-2">Face Strictness (<span id="face_val">0.55</span>)</label>
+                                    <input type="range" id="set_face" min="0.1" max="1.0" step="0.01" oninput="document.getElementById('face_val').innerText=this.value" class="w-full h-2 bg-black/10 dark:bg-white/10 rounded-full appearance-none cursor-pointer accent-emerald-600 dark:accent-emerald-400">
+                                </div>
+                            </div>
+                        </section>
+
+                        <section class="space-y-4">
+                            <div class="flex items-center gap-2 text-purple-600 dark:text-purple-400 font-medium text-sm">
+                                <i data-lucide="shield-check" class="w-5 h-5"></i> HUD Visualization
+                            </div>
+                            <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                                <button id="btn_draw" onclick="toggleSetting('draw_boxes')" class="flex items-center justify-between p-4 rounded-2xl border transition-all bg-transparent border-[var(--color-border)] opacity-70 hover:opacity-100">
+                                    <span class="text-sm font-medium">Draw Tracking Boxes</span>
+                                    <div class="w-12 h-6 rounded-full relative transition-colors bg-slate-300 dark:bg-slate-600">
+                                        <div class="absolute top-1 w-4 h-4 rounded-full bg-white transition-all left-1"></div>
+                                    </div>
+                                </button>
+                                <button id="btn_range" onclick="toggleSetting('show_range')" class="flex items-center justify-between p-4 rounded-2xl border transition-all bg-transparent border-[var(--color-border)] opacity-70 hover:opacity-100">
+                                    <span class="text-sm font-medium">Target Range HUD</span>
+                                    <div class="w-12 h-6 rounded-full relative transition-colors bg-slate-300 dark:bg-slate-600">
+                                        <div class="absolute top-1 w-4 h-4 rounded-full bg-white transition-all left-1"></div>
+                                    </div>
+                                </button>
+                            </div>
+                        </section>
+
+                        <div class="pt-4 border-t border-[var(--color-border)]">
+                            <button onclick="saveSettings(this)" class="w-full py-4 bg-blue-600 hover:bg-blue-700 text-white font-medium rounded-full shadow-sm transition-all flex items-center justify-center gap-2 active:scale-95">
+                                <i data-lucide="save" class="w-5 h-5"></i> Sync Parameters to Engine
+                            </button>
+                        </div>
+                    </div>
+
+                </div>
+            </div>
+        </div>
+        <!-- CUSTOM RULES VIEW -->
+        <div id="view-custom" class="view-section hidden animate-in">
+            <div class="space-y-8">
+
+                <!-- Side-by-side: Door Access Roles + ERA Access -->
+                <div class="grid grid-cols-1 xl:grid-cols-2 gap-6 items-start">
+
+                    <!-- Door Access Roles -->
+                    <div class="bento-card p-8">
+                        <div class="flex items-center justify-between mb-8">
+                            <div class="flex items-center gap-4">
+                                <div class="p-3 bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400 rounded-full">
+                                    <i data-lucide="shield-alert" class="w-8 h-8"></i>
+                                </div>
+                                <div>
+                                    <h2 class="text-2xl font-bold">Door Access Roles</h2>
+                                    <p class="opacity-70 text-sm">Configure allow/deny rules for individuals entering the door zone</p>
+                                </div>
+                            </div>
+                            <div>
+                                <select id="door_action" onchange="updateViolationAction('door', this.value)" class="px-4 py-2 bg-black/5 dark:bg-white/5 border border-[var(--color-border)] rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500/40 text-sm font-medium cursor-pointer">
+                                    <option value="log">Log Event Only</option>
+                                    <option value="alarm">Trigger Alarm</option>
+                                    <option value="alert">Send SMS Alert</option>
+                                    <option value="lockdown">Initiate Lockdown</option>
+                                </select>
+                            </div>
+                        </div>
+
+                        <div class="overflow-x-auto">
+                            <table class="w-full text-left border-collapse">
+                                <thead>
+                                    <tr class="text-sm font-medium opacity-70 border-b border-[var(--color-border)]">
+                                        <th class="py-4 font-medium pl-4">Face Image</th>
+                                        <th class="py-4 font-medium">Name</th>
+                                        <th class="py-4 font-medium pr-4">Access Role</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="custom-rules-tbody" class="divide-y divide-[var(--color-border)]">
+                                    <tr><td colspan="3" class="text-center py-10 opacity-70">Loading Database...</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+
+                    <!-- ERA Access -->
+                    <div class="bento-card p-8">
+                        <div class="flex items-center justify-between mb-8">
+                            <div class="flex items-center gap-4">
+                                <div class="p-3 bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-400 rounded-full">
+                                    <i data-lucide="key" class="w-8 h-8"></i>
+                                </div>
+                                <div>
+                                    <h2 class="text-2xl font-bold">ERA Access</h2>
+                                    <p class="opacity-70 text-sm">Configure allow/deny rules for individuals entering the ERA zone</p>
+                                </div>
+                            </div>
+                            <div>
+                                <select id="era_action" onchange="updateViolationAction('era', this.value)" class="px-4 py-2 bg-black/5 dark:bg-white/5 border border-[var(--color-border)] rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500/40 text-sm font-medium cursor-pointer">
+                                    <option value="log">Log Event Only</option>
+                                    <option value="alarm">Trigger Alarm</option>
+                                    <option value="alert">Send SMS Alert</option>
+                                    <option value="lockdown">Initiate Lockdown</option>
+                                </select>
+                            </div>
+                        </div>
+
+                        <div class="overflow-x-auto">
+                            <table class="w-full text-left border-collapse">
+                                <thead>
+                                    <tr class="text-sm font-medium opacity-70 border-b border-[var(--color-border)]">
+                                        <th class="py-4 font-medium pl-4">Face Image</th>
+                                        <th class="py-4 font-medium">Name</th>
+                                        <th class="py-4 font-medium pr-4">Access Role</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="era-rules-tbody" class="divide-y divide-[var(--color-border)]">
+                                    <tr><td colspan="3" class="text-center py-10 opacity-70">Loading Database...</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+
+                </div>
+
+                <!-- Container for dynamic custom spaces (full-width below) -->
+                <div id="dynamic-spaces-container" class="space-y-8"></div>
+
+                <div class="flex justify-center pt-4">
+                    <button onclick="addCustomSpace()" class="px-6 py-3 bg-black/5 dark:bg-white/5 hover:bg-black/10 dark:hover:bg-white/10 rounded-full font-medium transition-colors flex items-center gap-2">
+                        <i data-lucide="plus" class="w-5 h-5"></i> Add Custom Space
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- AI INTEGRATION VIEW -->
+        <div id="view-ai" class="view-section hidden animate-in">
+            <div class="space-y-6">
+
+                <!-- Status Banner -->
+                <div id="ai-status-banner" class="hidden items-center gap-3 px-6 py-4 rounded-2xl border text-sm font-medium"></div>
+
+                <!-- Side-by-side grid: AI Integration + Test AI Connection -->
+                <div class="grid grid-cols-1 xl:grid-cols-2 gap-6 items-start">
+
+                    <!-- Provider Config Card -->
+                    <div class="bento-card p-8">
+                        <div class="flex items-center gap-4 mb-8">
+                            <div class="p-3 bg-violet-100 text-violet-700 dark:bg-violet-900/30 dark:text-violet-400 rounded-full">
+                                <i data-lucide="cpu" class="w-8 h-8"></i>
+                            </div>
+                            <div>
+                                <h2 class="text-2xl font-bold">AI Integration</h2>
+                                <p class="opacity-70 text-sm">Connect an AI language model to enhance system intelligence</p>
+                            </div>
+                        </div>
+
+                        <div class="space-y-6">
+                            <!-- Enable Toggle -->
+                            <div class="flex items-center justify-between p-4 rounded-2xl border border-[var(--color-border)] bg-black/5 dark:bg-white/5">
+                                <div>
+                                    <div class="font-medium">Enable AI Assistant</div>
+                                    <div class="text-xs opacity-60 mt-0.5">Allow the system to use AI for analysis and alerts</div>
+                                </div>
+                                <button id="ai-toggle-btn" onclick="toggleAiEnabled()" class="flex items-center justify-between p-1 rounded-full relative transition-all w-12 h-6 bg-slate-300 dark:bg-slate-600">
+                                    <div id="ai-toggle-knob" class="absolute top-1 w-4 h-4 rounded-full bg-white transition-all left-1"></div>
+                                </button>
+                            </div>
+
+                            <!-- Provider Select -->
+                            <div>
+                                <label class="block text-sm font-medium opacity-70 mb-2">AI Provider</label>
+                                <select id="ai-provider" onchange="onProviderChange()" class="w-full px-4 py-3 bg-black/5 dark:bg-white/5 border border-[var(--color-border)] rounded-2xl focus:outline-none focus:ring-2 focus:ring-violet-500/40 transition-all font-medium appearance-none cursor-pointer">
+                                    <option value="none">-- Select Provider --</option>
+                                    <option value="openai">OpenAI (gpt-4.1, o3, o4-mini...)</option>
+                                    <option value="gemini">Google Gemini (gemini-2.5-flash, gemini-2.5-pro...)</option>
+                                    <option value="anthropic">Anthropic Claude (claude-sonnet-4-5, claude-opus-4...)</option>
+                                    <option value="ollama">Ollama (Local / Self-hosted)</option>
+                                </select>
+                            </div>
+
+                            <!-- Model Input -->
+                            <div id="ai-model-row">
+                                <label class="block text-sm font-medium opacity-70 mb-2">Model Name</label>
+                                <input type="text" id="ai-model" placeholder="e.g. gpt-4o" class="w-full px-4 py-3 bg-black/5 dark:bg-white/5 border border-[var(--color-border)] rounded-2xl placeholder:opacity-50 focus:outline-none focus:ring-2 focus:ring-violet-500/40 transition-all font-medium">
+                            </div>
+
+                            <!-- API Key -->
+                            <div id="ai-key-row">
+                                <label class="block text-sm font-medium opacity-70 mb-2">API Key</label>
+                                <div class="relative">
+                                    <input type="password" id="ai-api-key" placeholder="Enter your API key..." class="w-full px-4 py-3 pr-12 bg-black/5 dark:bg-white/5 border border-[var(--color-border)] rounded-2xl placeholder:opacity-50 focus:outline-none focus:ring-2 focus:ring-violet-500/40 transition-all font-medium font-mono text-sm">
+                                    <button onclick="toggleKeyVisibility()" class="absolute right-4 top-1/2 -translate-y-1/2 opacity-50 hover:opacity-100 transition-opacity">
+                                        <i data-lucide="eye" id="eye-icon" class="w-4 h-4"></i>
+                                    </button>
+                                </div>
+                                <p id="ai-key-hint" class="text-xs opacity-50 mt-2"></p>
+                            </div>
+
+                            <!-- Ollama Base URL (only for Ollama) -->
+                            <div id="ai-ollama-row" class="hidden">
+                                <label class="block text-sm font-medium opacity-70 mb-2">Ollama Base URL</label>
+                                <input type="text" id="ai-ollama-url" placeholder="http://localhost:11434" class="w-full px-4 py-3 bg-black/5 dark:bg-white/5 border border-[var(--color-border)] rounded-2xl placeholder:opacity-50 focus:outline-none focus:ring-2 focus:ring-violet-500/40 transition-all font-medium">
+                            </div>
+
+                            <!-- Save Button -->
+                            <div class="pt-4 border-t border-[var(--color-border)]">
+                                <button onclick="saveAiSettings(this)" class="w-full py-4 bg-violet-600 hover:bg-violet-700 text-white font-medium rounded-full shadow-sm transition-all flex items-center justify-center gap-2 active:scale-95">
+                                    <i data-lucide="save" class="w-5 h-5"></i> Save AI Configuration
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Chat Card with History Sidebar -->
+                    <div class="bento-card flex overflow-hidden" style="height: 620px;">
+
+                        <!-- Sidebar: Chat History -->
+                        <div class="flex flex-col shrink-0 border-r border-[var(--color-border)]" style="width:220px;">
+                            <!-- New Chat Button -->
+                            <div class="p-3 shrink-0">
+                                <button onclick="newChat()" class="w-full flex items-center gap-2 px-3 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-sm font-medium transition-all active:scale-95 shadow-sm">
+                                    <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg>
+                                    New Chat
+                                </button>
+                            </div>
+                            <!-- History Label -->
+                            <div class="px-3 pb-1 shrink-0">
+                                <span class="text-xs font-semibold opacity-40 uppercase tracking-widest">History</span>
+                            </div>
+                            <!-- Conversation List -->
+                            <div id="chat-history-list" class="flex-1 overflow-y-auto px-2 pb-3 space-y-0.5">
+                                <div class="text-xs opacity-30 text-center py-6">No conversations yet</div>
+                            </div>
+                        </div>
+
+                        <!-- Main Chat Panel -->
+                        <div class="flex flex-col flex-1 min-w-0">
+                            <!-- Header -->
+                            <div class="flex items-center gap-3 px-5 py-4 border-b border-[var(--color-border)] shrink-0">
+                                <div class="p-2 bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400 rounded-full">
+                                    <i data-lucide="message-square" class="w-5 h-5"></i>
+                                </div>
+                                <div class="flex-1 min-w-0">
+                                    <div id="chat-title" class="font-bold text-base truncate">AI Chat</div>
+                                    <div class="opacity-50 text-xs">Chat with your configured AI provider</div>
+                                </div>
+                            </div>
+
+                            <!-- Messages Area -->
+                            <div id="chat-messages" class="flex-1 overflow-y-auto px-5 py-4 space-y-4">
+                                <div id="chat-empty" class="flex flex-col items-center justify-center h-full text-center opacity-40">
+                                    <i data-lucide="bot" class="w-10 h-10 mb-3"></i>
+                                    <p class="text-sm font-medium">Start a conversation</p>
+                                    <p class="text-xs mt-1">Ask the AI anything about your surveillance system</p>
+                                </div>
+                            </div>
+
+                            <!-- Input Bar -->
+                            <div class="p-3 border-t border-[var(--color-border)] shrink-0">
+                                <div class="flex gap-2 items-end">
+                                    <textarea id="ai-chat-input" rows="1" placeholder="Ask the AI something... (Enter to send)" onkeydown="handleChatKey(event)" oninput="this.style.height='auto';this.style.height=Math.min(this.scrollHeight,120)+'px'" class="flex-1 px-4 py-2.5 bg-black/5 dark:bg-white/5 border border-[var(--color-border)] rounded-2xl placeholder:opacity-50 focus:outline-none focus:ring-2 focus:ring-emerald-500/40 transition-all text-sm resize-none overflow-hidden" style="min-height:40px;"></textarea>
+                                    <button id="chat-send-btn" onclick="sendChatMessage()" class="shrink-0 w-10 h-10 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-40 text-white rounded-full flex items-center justify-center transition-all active:scale-95 shadow-sm">
+                                        <i data-lucide="send" class="w-4 h-4"></i>
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                </div>
+            </div>
+        </div>
+
+    </main>
+
+    <script>
+        lucide.createIcons();
+
+        // --- Theme Management ---
+        function toggleTheme() {
+            document.body.classList.toggle('light-mode');
+            const isLight = document.body.classList.contains('light-mode');
+            document.getElementById('theme-icon').setAttribute('data-lucide', isLight ? 'moon' : 'sun');
+            lucide.createIcons();
+        }
+
+        // --- Navigation ---
+        function switchView(viewId) {
+            document.querySelectorAll('.view-section').forEach(el => el.classList.add('hidden'));
+            document.getElementById('view-' + viewId).classList.remove('hidden');
+            
+            document.querySelectorAll('.nav-btn').forEach(el => {
+                el.classList.remove('active');
+                el.classList.add('opacity-70');
+            });
+            const activeBtn = document.getElementById('nav-' + viewId);
+            activeBtn.classList.add('active');
+            activeBtn.classList.remove('opacity-70');
+            
+            if(viewId === 'settings') loadSettings();
+            if(viewId === 'custom') loadCustomRules();
+            if(viewId === 'ai') loadAiSettings();
+        }
+
+        // --- Clock & Terminal ---
+        setInterval(() => {
+            const now = new Date().toLocaleTimeString();
+            document.getElementById('clock').innerText = now;
+            document.getElementById('term-time').innerText = `[${now}]`;
+        }, 1000);
+
+        let termLogs = [];
+        let lastLogsJSON = "";
+        
+        function renderTerminal() {
+            document.getElementById('terminal-logs').innerHTML = termLogs.map(l => `
+                <div class="opacity-80 hover:opacity-100 transition-opacity">
+                    ${l}
+                </div>
+            `).join('');
+        }
+        renderTerminal();
+
+        function runHeuristics(btn) {
+            btn.innerText = "Scanning...";
+            btn.classList.add('animate-pulse');
+            setTimeout(() => {
+                btn.innerText = "Run Behavioral Heuristics";
+                btn.classList.remove('animate-pulse');
+                termLogs.push("> BEHAVIORAL SCAN COMPLETE. ALL CLEAR.");
+                renderTerminal();
+            }, 1500);
+        }
+
+        // --- Global Data Fetching ---
+        let allFaces = [];
+
+        async function fetchStats() {
+            if (document.getElementById('view-dashboard').classList.contains('hidden')) return;
+            try {
+                const res = await fetch('/stats');
+                const data = await res.json();
+                document.getElementById('stat-range').innerText = data.currently_in_range;
+                document.getElementById('stat-faces').innerText = data.total_known_faces;
+                document.getElementById('stat-tracks').innerText = data.total_yolo_tracks;
+                
+                const newLogsJSON = JSON.stringify(data.logs);
+                if (lastLogsJSON !== newLogsJSON) {
+                    termLogs = data.logs;
+                    lastLogsJSON = newLogsJSON;
+                    renderTerminal();
+                }
+            } catch(e) {}
+        }
+        setInterval(fetchStats, 500);
+
+        async function fetchHistory() {
+            try {
+                const res = await fetch('/api/history');
+                const data = await res.json();
+                
+                // Update Dashboard Recent
+                if (!document.getElementById('view-dashboard').classList.contains('hidden')) {
+                    const recentDiv = document.getElementById('recent-scans');
+                    const activeData = data.filter(d => d.status === 'Active');
+                    const recentData = activeData.slice(0, 5);
+                    if (recentData.length === 0) {
+                        recentDiv.innerHTML = '<p class="text-sm opacity-70 text-center py-4">Waiting for events...</p>';
+                    } else {
+                        recentDiv.innerHTML = recentData.map(d => `
+                            <div class="flex items-center gap-4 p-3 bg-black/5 dark:bg-white/5 rounded-2xl hover:bg-black/10 dark:hover:bg-white/10 transition-colors group">
+                                <div class="w-10 h-10 bg-black/10 dark:bg-white/10 rounded-full flex items-center justify-center shrink-0">
+                                    <i data-lucide="user" class="w-5 h-5 opacity-50"></i>
+                                </div>
+                                <div class="flex-1">
+                                    <div class="text-sm font-medium group-hover:text-blue-500 transition-colors">${d.name}</div>
+                                    <div class="text-xs opacity-70">ID #${d.id} &bull; ${d.status}</div>
+                                </div>
+                                <div class="text-emerald-600 dark:text-emerald-400 font-mono text-xs font-medium">98%</div>
+                            </div>
+                        `).join('');
+                        lucide.createIcons();
+                    }
+                }
+
+                // Update History Table
+                if (!document.getElementById('view-history').classList.contains('hidden')) {
+                    const tbody = document.getElementById('history-tbody');
+                    if (data.length === 0) {
+                        tbody.innerHTML = '<tr><td colspan="5" class="text-center py-20 opacity-70">No history recorded yet.</td></tr>';
+                    } else {
+                        tbody.innerHTML = data.map(log => {
+                            let statusClass = log.status === 'Active' 
+                                ? 'bg-emerald-100 text-emerald-700 border-emerald-200 dark:bg-emerald-900/30 dark:text-emerald-400 dark:border-emerald-800' 
+                                : 'bg-slate-100 text-slate-700 border-slate-200 dark:bg-slate-800 dark:text-slate-300 dark:border-slate-700';
+                            return `
+                                <tr class="hover:bg-black/5 dark:hover:bg-white/5 transition-colors group">
+                                    <td class="py-4 pl-4 font-medium group-hover:text-blue-600 dark:group-hover:text-blue-400 transition-colors">
+                                        <div class="flex items-center gap-3">
+                                            <div class="w-8 h-8 rounded-full bg-black/5 dark:bg-white/5 flex items-center justify-center">
+                                                <i data-lucide="user" class="w-4 h-4 opacity-50"></i>
+                                            </div>
+                                            ${log.name}
+                                        </div>
+                                    </td>
+                                    <td class="py-4"><span class="px-3 py-1 rounded-full text-xs font-medium border ${statusClass}">${log.status}</span></td>
+                                    <td class="py-4 font-mono text-sm opacity-80">${log.login_time}</td>
+                                    <td class="py-4 font-mono text-sm opacity-80">${log.logout_time}</td>
+                                    <td class="py-4 pr-4 font-mono text-blue-600 dark:text-blue-400 font-medium text-right flex items-center justify-end gap-3">
+                                        ${log.duration}
+                                        ${log.status === 'Logged Out' ? `<button onclick="deleteHistoryItem(${log.id}, '${log.login_time}')" class="text-red-500 hover:text-red-700 opacity-0 group-hover:opacity-100 transition-opacity"><i data-lucide="trash-2" class="w-4 h-4"></i></button>` : ''}
+                                    </td>
+                                </tr>
+                            `;
+                        }).join('');
+                        lucide.createIcons();
+                    }
+                }
+            } catch(e) {}
+        }
+        
+        function clearHistory() {
+            if(confirm('Are you sure you want to clear all history?')) {
+                fetch('/api/history', {
+                    method: 'DELETE',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({id: 'all'})
+                }).then(() => fetchHistory());
+            }
+        }
+        
+        function deleteHistoryItem(id, loginTime) {
+            if(confirm('Delete this history record?')) {
+                fetch('/api/history', {
+                    method: 'DELETE',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({id: id, login_time: loginTime})
+                }).then(() => fetchHistory());
+            }
+        }
+
+        setInterval(fetchHistory, 2000);
+
+        // --- Identities ---
+        async function fetchFaces() {
+            try {
+                const res = await fetch('/faces');
+                allFaces = await res.json();
+                if (!document.getElementById('view-identities').classList.contains('hidden')) {
+                    renderFaces();
+                }
+            } catch(e) {}
+        }
+        setInterval(fetchFaces, 2000);
+        fetchFaces();
+
+        function renderFaces() {
+            const query = document.getElementById('id-search').value.toLowerCase();
+            const grid = document.getElementById('identities-grid');
+            
+            const filtered = allFaces.filter(f => f.name.toLowerCase().includes(query));
+            
+            if (filtered.length === 0) {
+                grid.innerHTML = `
+                    <div class="col-span-full py-20 text-center">
+                        <div class="w-20 h-20 bg-black/5 dark:bg-white/5 rounded-full flex items-center justify-center mx-auto mb-6">
+                            <i data-lucide="database" class="w-10 h-10 opacity-50"></i>
+                        </div>
+                        <h3 class="text-xl font-bold mb-2">Neural Database Empty</h3>
+                        <p class="opacity-70 max-w-xs mx-auto">No environmental entities mapped to the central matrix yet.</p>
+                    </div>
+                `;
+            } else {
+                grid.innerHTML = filtered.reverse().map(f => `
+                    <div class="bento-card p-6 group relative overflow-hidden">
+                        <div class="absolute top-0 right-0 p-4 opacity-0 group-hover:opacity-100 transition-opacity flex gap-2">
+                            <button onclick="editFace(${f.id}, '${f.name.replace(/'/g, "\\'")}')" class="p-2 bg-black/10 dark:bg-white/10 hover:bg-black/20 dark:hover:bg-white/20 rounded-full transition-colors">
+                                <i data-lucide="edit-2" class="w-4 h-4 opacity-70"></i>
+                            </button>
+                            <button onclick="deleteFace(${f.id})" class="p-2 bg-red-100 dark:bg-red-900/30 hover:bg-red-200 dark:hover:bg-red-800/40 rounded-full text-red-600 dark:text-red-400 transition-colors">
+                                <i data-lucide="trash-2" class="w-4 h-4"></i>
+                            </button>
+                        </div>
+                        <div class="flex flex-col items-center text-center">
+                            <div class="w-24 h-24 bg-black/5 dark:bg-white/5 rounded-full overflow-hidden mb-4 border border-[var(--color-border)] group-hover:border-blue-500/30 transition-all flex items-center justify-center">
+                                ${f.image ? `<img src="data:image/jpeg;base64,${f.image}" class="w-full h-full object-cover">` : `<i data-lucide="user" class="w-10 h-10 opacity-40"></i>`}
+                            </div>
+                            <div class="text-xl font-medium mb-1 group-hover:text-blue-600 dark:group-hover:text-blue-400 transition-colors">${f.name}</div>
+                            <div class="text-sm opacity-60 mb-4 font-mono">ID #${f.id}</div>
+                        </div>
+                    </div>
+                `).join('');
+            }
+            lucide.createIcons();
+        }
+
+        async function editFace(id, currentName) {
+            const newName = prompt(`Enter a new name for Person #${id}:`, currentName);
+            if (newName !== null) {
+                const newId = prompt(`Enter a new ID for ${newName.trim()} (leave blank to keep #${id}):`, id);
+                if (newId !== null) {
+                    const res = await fetch('/update_face', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ old_id: id, new_id: newId.trim(), name: newName.trim() })
+                    });
+                    const data = await res.json();
+                    if (!data.success) {
+                        alert("Error: " + data.error);
+                    }
+                    fetchFaces();
+                }
+            }
+        }
+
+        async function deleteFace(id) {
+            if(confirm("Are you sure you want to permanently delete this neural person from the matrix?")) {
+                await fetch('/delete_face/' + id, { method: 'DELETE' });
+                fetchFaces();
+            }
+        }
+
+        async function uploadFace() {
+            const name = document.getElementById('new_name').value;
+            const customId = document.getElementById('new_id').value;
+            const fileInput = document.getElementById('new_photo');
+            const btn = document.getElementById('btn-upload');
+            
+            if (!name || !fileInput.files[0]) {
+                alert("Please enter a designation and select a bitmap photo.");
+                return;
+            }
+            
+            const formData = new FormData();
+            formData.append('name', name);
+            if (customId) formData.append('custom_id', customId);
+            formData.append('file', fileInput.files[0]);
+            
+            btn.innerText = "Syncing...";
+            btn.style.opacity = "0.7";
+            
+            try {
+                const res = await fetch('/upload_face', { method: 'POST', body: formData });
+                const data = await res.json();
+                if(data.success) {
+                    document.getElementById('new_name').value = '';
+                    document.getElementById('new_id').value = '';
+                    fileInput.value = '';
+                    document.getElementById('add-modal').classList.add('hidden');
+                    fetchFaces();
+                } else {
+                    alert("Error: " + data.error);
+                }
+            } catch(e) {
+                alert("Upload failed.");
+            }
+            btn.innerText = "Confirm Sync";
+            btn.style.opacity = "1";
+        }
+
+        // --- Settings ---
+        let currentSettings = { draw_boxes: true, show_range: true };
+        
+        async function loadSettings() {
+            try {
+                const res = await fetch('/api/settings');
+                const conf = await res.json();
+                currentSettings = conf;
+                
+                document.getElementById('set_model').value = conf.yolo_model;
+                document.getElementById('set_imgsz').value = conf.imgsz;
+                
+                const camSource = conf.camera_source || 'local';
+                document.getElementById('set_camera').value = camSource;
+                document.getElementById('set_stream_url').value = conf.stream_url || 'rtsp://192.168.100.59:8554/lsc_camera';
+                document.getElementById('stream_url_container').style.display = camSource === 'stream' ? 'block' : 'none';
+                
+                document.getElementById('set_conf').value = conf.conf;
+                document.getElementById('conf_val').innerText = conf.conf;
+                
+                document.getElementById('set_face').value = conf.face_tolerance;
+                document.getElementById('face_val').innerText = conf.face_tolerance;
+                
+                document.getElementById('door_action').value = conf.door_action || 'log';
+                document.getElementById('era_action').value = conf.era_action || 'log';
+                
+                updateToggleUI('draw_boxes');
+                updateToggleUI('show_range');
+            } catch(e) {}
+        }
+
+        function toggleSetting(key) {
+            currentSettings[key] = !currentSettings[key];
+            updateToggleUI(key);
+        }
+
+        function updateToggleUI(key) {
+            const btn = document.getElementById(key === 'draw_boxes' ? 'btn_draw' : 'btn_range');
+            const val = currentSettings[key];
+            if (val) {
+                btn.className = "flex items-center justify-between p-4 rounded-2xl border transition-all bg-blue-50 dark:bg-blue-900/20 border-blue-200 dark:border-blue-800 text-blue-700 dark:text-blue-400";
+                btn.querySelector('div').className = "w-12 h-6 rounded-full relative transition-colors bg-blue-600 dark:bg-blue-500";
+                btn.querySelector('div > div').className = "absolute top-1 w-4 h-4 rounded-full bg-white transition-all left-7";
+            } else {
+                btn.className = "flex items-center justify-between p-4 rounded-2xl border transition-all bg-transparent border-[var(--color-border)] opacity-70 hover:opacity-100";
+                btn.querySelector('div').className = "w-12 h-6 rounded-full relative transition-colors bg-slate-300 dark:bg-slate-600";
+                btn.querySelector('div > div').className = "absolute top-1 w-4 h-4 rounded-full bg-white transition-all left-1";
+            }
+        }
+
+        async function saveSettings(btn) {
+            btn.innerHTML = `<i data-lucide="refresh-cw" class="w-5 h-5 animate-spin"></i> Syncing...`;
+            lucide.createIcons();
+            
+            const payload = {
+                yolo_model: document.getElementById('set_model').value,
+                imgsz: parseInt(document.getElementById('set_imgsz').value),
+                conf: parseFloat(document.getElementById('set_conf').value),
+                face_tolerance: parseFloat(document.getElementById('set_face').value),
+                draw_boxes: currentSettings.draw_boxes,
+                show_range: currentSettings.show_range,
+                camera_source: document.getElementById('set_camera').value,
+                stream_url: document.getElementById('set_stream_url').value
+            };
+            
+            await fetch('/api/settings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+            
+            setTimeout(() => {
+                btn.innerHTML = `<i data-lucide="save" class="w-5 h-5"></i> Sync Parameters to Engine`;
+                lucide.createIcons();
+            }, 500);
+        }
+
+        // --- Custom Rules Management ---
+        async function loadCustomRules() {
+            try {
+                const [facesRes, rulesRes, eraRes, spacesRes] = await Promise.all([
+                    fetch('/faces'),
+                    fetch('/api/rules'),
+                    fetch('/api/era_rules'),
+                    fetch('/api/custom_spaces')
+                ]);
+                const faces = await facesRes.json();
+                const rules = await rulesRes.json();
+                const eraRules = await eraRes.json();
+                const customSpaces = await spacesRes.json();
+                
+                const tbody = document.getElementById('custom-rules-tbody');
+                const eraBody = document.getElementById('era-rules-tbody');
+                if (faces.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="3" class="text-center py-10 opacity-70">No known records in Database yet.</td></tr>';
+                    eraBody.innerHTML = '<tr><td colspan="3" class="text-center py-10 opacity-70">No known records in Database yet.</td></tr>';
+                }
+                
+                const renderRows = (rulesDict, roleFuncName, extraArgs='') => faces.map(f => {
+                    const currentRole = rulesDict[f.id] || 'Not Allowed';
+                    const args = extraArgs ? `${extraArgs}, ${f.id}` : `${f.id}`;
+                    return `
+                        <tr class="hover:bg-black/5 dark:hover:bg-white/5 transition-colors group">
+                            <td class="py-4 pl-4">
+                                ${f.image ? `<img src="data:image/jpeg;base64,${f.image}" class="w-12 h-12 rounded-xl object-cover shadow-sm">` 
+                                          : `<div class="w-12 h-12 rounded-xl bg-black/10 dark:bg-white/10 flex items-center justify-center"><i data-lucide="user" class="w-6 h-6 opacity-50"></i></div>`}
+                            </td>
+                            <td class="py-4 font-bold text-lg">${f.name} <span class="text-xs font-normal opacity-50 ml-2">#${f.id}</span></td>
+                            <td class="py-4 pr-4 w-32">
+                                ${currentRole === 'Allowed'
+                                    ? `<button onclick="${roleFuncName}(${args}, 'Not Allowed')" class="w-full py-2 bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400 hover:bg-red-200 dark:hover:bg-red-800/40 rounded-full text-sm font-bold transition-all flex items-center justify-center gap-1 shadow-sm"><i data-lucide="minus-circle" class="w-4 h-4"></i> Remove</button>`
+                                    : `<button onclick="${roleFuncName}(${args}, 'Allowed')" class="w-full py-2 bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400 hover:bg-emerald-200 dark:hover:bg-emerald-800/40 rounded-full text-sm font-bold transition-all flex items-center justify-center gap-1 shadow-sm"><i data-lucide="plus-circle" class="w-4 h-4"></i> Add</button>`
+                                }
+                            </td>
+                        </tr>
+                    `;
+                }).join('');
+
+                if (faces.length > 0) {
+                    tbody.innerHTML = renderRows(rules, 'updateRole');
+                    eraBody.innerHTML = renderRows(eraRules, 'updateEraRole');
+                }
+
+                const container = document.getElementById('dynamic-spaces-container');
+                container.innerHTML = Object.keys(customSpaces).map(spaceName => {
+                    const spaceData = customSpaces[spaceName];
+                    const rulesDict = spaceData.rules || {};
+                    const action = spaceData.action || 'log';
+                    
+                    let rows = '<tr><td colspan="3" class="text-center py-10 opacity-70">No known records in Database yet.</td></tr>';
+                    if (faces.length > 0) {
+                        rows = renderRows(rulesDict, 'updateCustomSpaceRole', `'${spaceName}'`);
+                    }
+
+                    return `
+                        <div class="bento-card p-10 relative mt-8">
+                            <button onclick="deleteCustomSpace('${spaceName}')" class="absolute top-4 right-4 p-2 text-red-500 hover:bg-red-500/10 rounded-full transition-colors" title="Delete Space">
+                                <i data-lucide="trash-2" class="w-5 h-5"></i>
+                            </button>
+                            <div class="flex items-center justify-between mb-8 pr-10">
+                                <div class="flex items-center gap-4">
+                                    <div class="p-3 bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400 rounded-full">
+                                        <i data-lucide="map-pin" class="w-8 h-8"></i>
+                                    </div>
+                                    <div>
+                                        <h2 class="text-3xl font-bold">${spaceName} Access</h2>
+                                        <p class="opacity-70 text-sm">Configure allow/deny rules for individuals entering the ${spaceName} zone</p>
+                                    </div>
+                                </div>
+                                <div>
+                                    <select onchange="updateCustomSpaceAction('${spaceName}', this.value)" class="px-4 py-2 bg-black/5 dark:bg-white/5 border border-[var(--color-border)] rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500/40 text-sm font-medium cursor-pointer">
+                                        <option value="log" ${action === 'log' ? 'selected' : ''}>Log Event Only</option>
+                                        <option value="alarm" ${action === 'alarm' ? 'selected' : ''}>Trigger Alarm</option>
+                                        <option value="alert" ${action === 'alert' ? 'selected' : ''}>Send SMS Alert</option>
+                                        <option value="lockdown" ${action === 'lockdown' ? 'selected' : ''}>Initiate Lockdown</option>
+                                    </select>
+                                </div>
+                            </div>
+                            
+                            <div class="overflow-x-auto">
+                                <table class="w-full text-left border-collapse">
+                                    <thead>
+                                        <tr class="text-sm font-medium opacity-70 border-b border-[var(--color-border)]">
+                                            <th class="py-4 font-medium pl-4">Face Image</th>
+                                            <th class="py-4 font-medium">Name</th>
+                                            <th class="py-4 font-medium pr-4">Access Role</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody class="divide-y divide-[var(--color-border)]">
+                                        ${rows}
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    `;
+                }).join('');
+
+                lucide.createIcons();
+            } catch(e) {
+                console.error("Failed to load custom rules", e);
+            }
+        }
+        
+        async function updateRole(id, role) {
+            try {
+                await fetch('/api/rules', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({id, role})
+                });
+                loadCustomRules();
+            } catch(e) {
+                console.error("Failed to update role", e);
+            }
+        }
+
+        async function updateEraRole(id, role) {
+            try {
+                await fetch('/api/era_rules', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({id, role})
+                });
+                loadCustomRules();
+            } catch(e) {
+                console.error("Failed to update era role", e);
+            }
+        }
+
+        async function updateViolationAction(zone, action) {
+            try {
+                await fetch('/api/violation_action', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({zone, action})
+                });
+            } catch(e) {
+                console.error("Failed to update violation action", e);
+            }
+        }
+
+        async function addCustomSpace() {
+            const name = prompt("Enter a name for the new custom space (e.g. Server Room):");
+            if (!name || name.trim() === "") return;
+            try {
+                await fetch('/api/add_custom_space', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({name: name.trim()})
+                });
+                loadCustomRules();
+            } catch(e) {}
+        }
+        
+        async function deleteCustomSpace(name) {
+            if (!confirm(`Are you sure you want to delete the space "${name}"?`)) return;
+            try {
+                await fetch('/api/delete_custom_space', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({name})
+                });
+                loadCustomRules();
+            } catch(e) {}
+        }
+
+        async function updateCustomSpaceRole(spaceName, id, role) {
+            try {
+                await fetch('/api/custom_space_rule', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({space_name: spaceName, id, role})
+                });
+                loadCustomRules();
+            } catch(e) {}
+        }
+
+        async function updateCustomSpaceAction(spaceName, action) {
+            try {
+                await fetch('/api/custom_space_action', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({space_name: spaceName, action})
+                });
+            } catch(e) {}
+        }
+
+        // ====== AI INTEGRATION ======
+        let aiEnabled = false;
+
+        const providerModels = {
+            openai: 'gpt-4.1',
+            gemini: 'gemini-2.5-flash',
+            anthropic: 'claude-sonnet-4-5',
+            ollama: 'llama3.3'
+        };
+
+        const providerKeyHints = {
+            openai: 'Get your key at platform.openai.com',
+            gemini: 'Get your key at aistudio.google.com',
+            anthropic: 'Get your key at console.anthropic.com',
+            ollama: 'No API key required for local Ollama'
+        };
+
+        function onProviderChange() {
+            const provider = document.getElementById('ai-provider').value;
+            const modelInput = document.getElementById('ai-model');
+            const keyHint = document.getElementById('ai-key-hint');
+            const ollamaRow = document.getElementById('ai-ollama-row');
+            const keyRow = document.getElementById('ai-key-row');
+
+            if (provider === 'none') {
+                modelInput.placeholder = 'Select a provider first';
+                keyRow.style.display = 'block';
+                ollamaRow.classList.add('hidden');
+                return;
+            }
+
+            modelInput.value = providerModels[provider] || '';
+            modelInput.placeholder = providerModels[provider] || 'Enter model name';
+            keyHint.textContent = providerKeyHints[provider] || '';
+
+            if (provider === 'ollama') {
+                keyRow.style.display = 'none';
+                ollamaRow.classList.remove('hidden');
+            } else {
+                keyRow.style.display = 'block';
+                ollamaRow.classList.add('hidden');
+            }
+        }
+
+        function toggleAiEnabled() {
+            aiEnabled = !aiEnabled;
+            const btn = document.getElementById('ai-toggle-btn');
+            const knob = document.getElementById('ai-toggle-knob');
+            if (aiEnabled) {
+                btn.className = 'flex items-center justify-between p-1 rounded-full relative transition-all w-12 h-6 bg-violet-600';
+                knob.className = 'absolute top-1 w-4 h-4 rounded-full bg-white transition-all left-7';
+            } else {
+                btn.className = 'flex items-center justify-between p-1 rounded-full relative transition-all w-12 h-6 bg-slate-300 dark:bg-slate-600';
+                knob.className = 'absolute top-1 w-4 h-4 rounded-full bg-white transition-all left-1';
+            }
+        }
+
+        function toggleKeyVisibility() {
+            const input = document.getElementById('ai-api-key');
+            const icon = document.getElementById('eye-icon');
+            if (input.type === 'password') {
+                input.type = 'text';
+                icon.setAttribute('data-lucide', 'eye-off');
+            } else {
+                input.type = 'password';
+                icon.setAttribute('data-lucide', 'eye');
+            }
+            lucide.createIcons();
+        }
+
+        function showAiBanner(msg, type) {
+            const banner = document.getElementById('ai-status-banner');
+            const colors = {
+                success: 'bg-emerald-100 border-emerald-300 text-emerald-800 dark:bg-emerald-900/30 dark:border-emerald-700 dark:text-emerald-300',
+                error: 'bg-red-100 border-red-300 text-red-800 dark:bg-red-900/30 dark:border-red-700 dark:text-red-300',
+                info: 'bg-blue-100 border-blue-300 text-blue-800 dark:bg-blue-900/30 dark:border-blue-700 dark:text-blue-300'
+            };
+            banner.className = `flex items-center gap-3 px-6 py-4 rounded-2xl border text-sm font-medium ${colors[type]}`;
+            banner.innerHTML = `<i data-lucide="${type === 'success' ? 'check-circle' : type === 'error' ? 'x-circle' : 'info'}" class="w-5 h-5"></i> ${msg}`;
+            banner.classList.remove('hidden');
+            lucide.createIcons();
+            setTimeout(() => banner.classList.add('hidden'), 5000);
+        }
+
+        async function loadAiSettings() {
+            try {
+                const res = await fetch('/api/ai_settings');
+                const conf = await res.json();
+
+                document.getElementById('ai-provider').value = conf.provider || 'none';
+                document.getElementById('ai-model').value = conf.model || '';
+                document.getElementById('ai-api-key').value = conf.api_key || '';
+                document.getElementById('ai-ollama-url').value = conf.ollama_url || 'http://localhost:11434';
+
+                aiEnabled = conf.enabled || false;
+                // Sync toggle UI
+                const btn = document.getElementById('ai-toggle-btn');
+                const knob = document.getElementById('ai-toggle-knob');
+                if (aiEnabled) {
+                    btn.className = 'flex items-center justify-between p-1 rounded-full relative transition-all w-12 h-6 bg-violet-600';
+                    knob.className = 'absolute top-1 w-4 h-4 rounded-full bg-white transition-all left-7';
+                } else {
+                    btn.className = 'flex items-center justify-between p-1 rounded-full relative transition-all w-12 h-6 bg-slate-300 dark:bg-slate-600';
+                    knob.className = 'absolute top-1 w-4 h-4 rounded-full bg-white transition-all left-1';
+                }
+
+                onProviderChange();
+            } catch(e) { console.error('Failed to load AI settings', e); }
+        }
+
+        async function saveAiSettings(btn) {
+            btn.innerHTML = '<i data-lucide="refresh-cw" class="w-5 h-5 animate-spin"></i> Saving...';
+            lucide.createIcons();
+            const payload = {
+                provider: document.getElementById('ai-provider').value,
+                model: document.getElementById('ai-model').value,
+                api_key: document.getElementById('ai-api-key').value,
+                ollama_url: document.getElementById('ai-ollama-url').value,
+                enabled: aiEnabled
+            };
+            try {
+                const res = await fetch('/api/ai_settings', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(payload)
+                });
+                const data = await res.json();
+                if (data.success) showAiBanner('AI configuration saved successfully.', 'success');
+                else showAiBanner('Failed to save: ' + (data.error || 'Unknown error'), 'error');
+            } catch(e) {
+                showAiBanner('Could not reach the server.', 'error');
+            }
+            btn.innerHTML = '<i data-lucide="save" class="w-5 h-5"></i> Save AI Configuration';
+            lucide.createIcons();
+        }
+
+        // ====== AI CHAT WITH HISTORY ======
+        const CHAT_STORAGE_KEY = 'gamma_chat_history';
+        let conversations = [];   // [{id, title, messages:[{role,text}], ts}]
+        let activeChatId = null;
+        let chatBusy = false;
+
+        // ---------- Persistence ----------
+        function saveConversations() {
+            try { localStorage.setItem(CHAT_STORAGE_KEY, JSON.stringify(conversations)); } catch(e){}
+        }
+        function loadConversations() {
+            try {
+                const raw = localStorage.getItem(CHAT_STORAGE_KEY);
+                if (raw) conversations = JSON.parse(raw);
+            } catch(e) { conversations = []; }
+        }
+
+        // ---------- Sidebar ----------
+        function renderSidebar() {
+            const list = document.getElementById('chat-history-list');
+            if (conversations.length === 0) {
+                list.innerHTML = '<div class="text-xs opacity-30 text-center py-6">No conversations yet</div>';
+                return;
+            }
+            list.innerHTML = '';
+            // Newest first
+            [...conversations].reverse().forEach(conv => {
+                const isActive = conv.id === activeChatId;
+                const item = document.createElement('div');
+                item.className = `group flex items-center gap-1 px-2 py-2 rounded-xl cursor-pointer text-xs font-medium transition-all ${
+                    isActive ? 'bg-emerald-600/20 text-emerald-500' : 'hover:bg-black/5 dark:hover:bg-white/5 opacity-70 hover:opacity-100'
+                }`;
+                item.innerHTML = `
+                    <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="shrink-0"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+                    <span class="flex-1 truncate" title="${conv.title}">${conv.title}</span>
+                    <button onclick="event.stopPropagation();deleteConversation('${conv.id}')" class="shrink-0 opacity-0 group-hover:opacity-60 hover:!opacity-100 transition-opacity p-0.5 rounded" title="Delete">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg>
+                    </button>
+                `;
+                item.addEventListener('click', () => loadChat(conv.id));
+                list.appendChild(item);
+            });
+        }
+
+        // ---------- Chat lifecycle ----------
+        function newChat() {
+            activeChatId = null;
+            document.getElementById('chat-title').textContent = 'New Chat';
+            resetChatPane();
+            document.getElementById('ai-chat-input').focus();
+            renderSidebar();
+        }
+
+        function loadChat(id) {
+            const conv = conversations.find(c => c.id === id);
+            if (!conv) return;
+            activeChatId = id;
+            document.getElementById('chat-title').textContent = conv.title;
+            resetChatPane();
+            conv.messages.forEach(m => appendMessage(m.role, m.text, false));
+            renderSidebar();
+        }
+
+        function deleteConversation(id) {
+            conversations = conversations.filter(c => c.id !== id);
+            saveConversations();
+            if (activeChatId === id) newChat();
+            else renderSidebar();
+        }
+
+        function resetChatPane() {
+            const msgs = document.getElementById('chat-messages');
+            msgs.innerHTML = `<div id="chat-empty" class="flex flex-col items-center justify-center h-full text-center opacity-40">
+                <svg xmlns="http://www.w3.org/2000/svg" width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" class="mb-3"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+                <p class="text-sm font-medium">Start a conversation</p>
+                <p class="text-xs mt-1">Ask the AI anything about your surveillance system</p>
+            </div>`;
+        }
+
+        // Keep old clearChat name working
+        function clearChat() { newChat(); }
+
+        // ---------- Message rendering ----------
+        function appendMessage(role, text, save=true) {
+            const empty = document.getElementById('chat-empty');
+            if (empty) empty.remove();
+            const msgs = document.getElementById('chat-messages');
+            const isUser = role === 'user';
+            const wrapper = document.createElement('div');
+            wrapper.className = `flex ${isUser ? 'justify-end' : 'justify-start'} animate-in`;
+            const botAvatar = `<div class="shrink-0 w-7 h-7 rounded-full bg-emerald-100 dark:bg-emerald-900/40 text-emerald-600 dark:text-emerald-400 flex items-center justify-center mr-2"><svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 8V4H8"/><rect width="16" height="12" x="4" y="8" rx="2"/><path d="M2 14h2"/><path d="M20 14h2"/><path d="M15 13v2"/><path d="M9 13v2"/></svg></div>`;
+            const userAvatar = `<div class="shrink-0 w-7 h-7 rounded-full bg-blue-100 dark:bg-blue-900/40 text-blue-600 dark:text-blue-400 flex items-center justify-center ml-2"><svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg></div>`;
+            wrapper.innerHTML = `
+                ${isUser ? '' : botAvatar}
+                <div class="max-w-[80%] px-4 py-2.5 rounded-2xl text-sm leading-relaxed whitespace-pre-wrap ${
+                    isUser ? 'bg-emerald-600 text-white rounded-br-sm' : 'bg-black/5 dark:bg-white/5 border border-[var(--color-border)] rounded-bl-sm'
+                }">${text.replace(/</g,'&lt;').replace(/>/g,'&gt;')}</div>
+                ${isUser ? userAvatar : ''}
+            `;
+            msgs.appendChild(wrapper);
+            msgs.scrollTop = msgs.scrollHeight;
+
+            // Persist to conversation
+            if (save) {
+                if (!activeChatId) {
+                    // Create new conversation
+                    activeChatId = 'chat_' + Date.now();
+                    const title = text.length > 40 ? text.slice(0, 40) + '…' : text;
+                    conversations.push({ id: activeChatId, title, messages: [], ts: Date.now() });
+                    document.getElementById('chat-title').textContent = title;
+                }
+                const conv = conversations.find(c => c.id === activeChatId);
+                if (conv) conv.messages.push({role, text});
+                saveConversations();
+                renderSidebar();
+            }
+        }
+
+        function appendTyping() {
+            const empty = document.getElementById('chat-empty');
+            if (empty) empty.remove();
+            const msgs = document.getElementById('chat-messages');
+            const el = document.createElement('div');
+            el.id = 'chat-typing';
+            el.className = 'flex justify-start animate-in';
+            el.innerHTML = `
+                <div class="shrink-0 w-7 h-7 rounded-full bg-emerald-100 dark:bg-emerald-900/40 text-emerald-600 dark:text-emerald-400 flex items-center justify-center mr-2"><svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 8V4H8"/><rect width="16" height="12" x="4" y="8" rx="2"/><path d="M2 14h2"/><path d="M20 14h2"/><path d="M15 13v2"/><path d="M9 13v2"/></svg></div>
+                <div class="px-4 py-2.5 rounded-2xl rounded-bl-sm bg-black/5 dark:bg-white/5 border border-[var(--color-border)] flex gap-1.5 items-center">
+                    <span class="w-1.5 h-1.5 rounded-full bg-current opacity-60 animate-bounce" style="animation-delay:0ms"></span>
+                    <span class="w-1.5 h-1.5 rounded-full bg-current opacity-60 animate-bounce" style="animation-delay:150ms"></span>
+                    <span class="w-1.5 h-1.5 rounded-full bg-current opacity-60 animate-bounce" style="animation-delay:300ms"></span>
+                </div>`;
+            msgs.appendChild(el);
+            msgs.scrollTop = msgs.scrollHeight;
+        }
+        function removeTyping() { const el = document.getElementById('chat-typing'); if (el) el.remove(); }
+
+        function handleChatKey(e) {
+            if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendChatMessage(); }
+        }
+
+        async function sendChatMessage() {
+            if (chatBusy) return;
+            const input = document.getElementById('ai-chat-input');
+            const btn = document.getElementById('chat-send-btn');
+            const prompt = input.value.trim();
+            if (!prompt) return;
+            chatBusy = true;
+            input.value = '';
+            input.style.height = '40px';
+            btn.disabled = true;
+            appendMessage('user', prompt);
+            appendTyping();
+            try {
+                const res = await fetch('/api/ai_query', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({prompt})
+                });
+                const data = await res.json();
+                removeTyping();
+                appendMessage('ai', data.success ? data.response : ('\u26a0\ufe0f Error: ' + (data.error || 'Unknown error')));
+                if (!data.success) showAiBanner(data.error || 'AI query failed.', 'error');
+            } catch(e) {
+                removeTyping();
+                appendMessage('ai', '\u26a0\ufe0f Network error. Make sure the server is running.');
+                showAiBanner('Network error.', 'error');
+            }
+            chatBusy = false;
+            btn.disabled = false;
+            input.focus();
+        }
+
+        // Init on page load
+        loadConversations();
+        renderSidebar();
+
+        // Legacy shim
+        async function testAiPrompt(btn) { sendChatMessage(); }
+
+    </script>
+</body>
+</html>
+"""
+
+@app.route('/')
+def index():
+    return render_template_string(INDEX_HTML)
+
+if __name__ == '__main__':
+    print("\n" + "="*50)
+    print("🚀 SMART DOOR NEURAL ENGINE RUNNING")
+    print("Open your web browser and go to: http://127.0.0.1:5000")
+    print("="*50 + "\n")
+    app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
